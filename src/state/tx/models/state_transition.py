@@ -634,7 +634,7 @@ class StateTransitionPerturbationModel(PerturbationModel):
         try:
             parsed = ast.literal_eval(name)
             if isinstance(parsed, (list, tuple)) and len(parsed) > 0:
-               first_entry = parsed[0]
+                first_entry = parsed[0]
                 if isinstance(first_entry, (list, tuple)) and len(first_entry) > 0:
                     return str(first_entry[0])
         except (ValueError, SyntaxError):
