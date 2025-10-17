@@ -234,7 +234,7 @@ def run_tx_train(cfg: DictConfig):
 
         callbacks.append(mfu_cb)
 
-    if "cumulative_flops_use_backward" in cfg["training"]:
+    if "cumulative_flops_use_backward" in cfg["training"] and cfg["model"]["name"] == "state":
         cumulative_flops_use_backward = cfg["training"]["cumulative_flops_use_backward"]
         cumulative_flops_cb = CumulativeFLOPSCallback(use_backward=cumulative_flops_use_backward)
         callbacks.append(cumulative_flops_cb)

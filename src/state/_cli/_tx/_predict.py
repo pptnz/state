@@ -13,6 +13,12 @@ def add_arguments_predict(parser: ap.ArgumentParser):
         help="Path to the output_dir containing the config.yaml file that was saved during training.",
     )
     parser.add_argument(
+        "--toml",
+        type=str,
+        default=None,
+        help="Optional path to a TOML data config to use instead of the training config.",
+    )
+    parser.add_argument(
         "--checkpoint",
         type=str,
         default="last.ckpt",
@@ -130,12 +136,34 @@ def run_tx_predict(args: ap.ArgumentParser):
     cfg = load_config(config_path)
     logger.info(f"Loaded config from {config_path}")
 
+    if args.toml:
+        data_section = cfg.get("data")
+        if data_section is None or "kwargs" not in data_section:
+            raise KeyError(
+                "The loaded config does not contain data.kwargs, unable to override toml_config_path."
+            )
+        cfg["data"]["kwargs"]["toml_config_path"] = args.toml
+        logger.info("Overriding data.kwargs.toml_config_path to %s", args.toml)
+
     # 2. Find run output directory & load data module
     run_output_dir = os.path.join(cfg["output_dir"], cfg["name"])
     data_module_path = os.path.join(run_output_dir, "data_module.torch")
     if not os.path.exists(data_module_path):
         raise FileNotFoundError(f"Could not find data module at {data_module_path}?")
     data_module = PerturbationDataModule.load_state(data_module_path)
+    if args.toml:
+        if not os.path.exists(args.toml):
+            raise FileNotFoundError(f"Could not find TOML config file at {args.toml}")
+        from cell_load.config import ExperimentConfig
+
+        logger.info("Reloading data module configuration from %s", args.toml)
+        data_module.toml_config_path = args.toml
+        data_module.config = ExperimentConfig.from_toml(args.toml)
+        data_module.config.validate()
+        data_module.train_datasets = []
+        data_module.val_datasets = []
+        data_module.test_datasets = []
+        data_module._setup_global_maps()
     data_module.setup(stage="test")
     logger.info("Loaded data module from %s", data_module_path)
 
