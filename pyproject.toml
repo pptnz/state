@@ -27,13 +27,14 @@ dependencies = [
     "geomloss>=0.2.6",
     "transformers>=4.52.3",
     "peft>=0.11.0",
-    "cell-eval>=0.6.0",
+    "cell-eval>=0.6.2",
     "ipykernel>=6.30.1",
     "scipy>=1.15.0",
 ]
 
 [tool.uv.sources]
 cell-load = {path = "/home/aadduri/cell-load"}
+cell-eval = {git = "https://github.com/ArcInstitute/cell-eval", branch = "aadduri/aupr_curves"}
 
 [project.optional-dependencies]
 vectordb = [
