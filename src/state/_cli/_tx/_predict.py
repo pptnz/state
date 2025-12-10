@@ -74,6 +74,7 @@ def run_tx_predict(args: ap.ArgumentParser):
     import lightning.pytorch as pl
     import numpy as np
     import pandas as pd
+    from scipy import sparse as sp
     import torch
     import yaml
 
@@ -130,6 +131,15 @@ def run_tx_predict(args: ap.ArgumentParser):
         with open(cfg_path, "r") as f:
             cfg = yaml.safe_load(f)
         return cfg
+
+    def clip_anndata_values(adata: anndata.AnnData, max_value: float) -> None:
+        """Clip adata.X values in-place to avoid extremely large log1p values."""
+        if sp.issparse(adata.X):
+            # Clip only the stored data to keep sparsity intact.
+            if adata.X.data.size:
+                np.clip(adata.X.data, None, max_value, out=adata.X.data)
+        else:
+            np.clip(adata.X, None, max_value, out=adata.X)
 
     # 1. Load the config
     config_path = os.path.join(args.output_dir, "config.yaml")
@@ -447,6 +457,11 @@ def run_tx_predict(args: ap.ArgumentParser):
         # Create adata for real - using the true gene expression values
         # adata_real = anndata.AnnData(X=final_reals, obs=obs, var=var)
         adata_real = anndata.AnnData(X=final_reals, obs=obs)
+
+    # Clip extreme values to keep cell-eval log1p checks happy.
+    clip_anndata_values(adata_pred, max_value=14.0)
+    clip_anndata_values(adata_real, max_value=14.0)
+    logger.info("Clipped adata_pred and adata_real X values to a maximum of 14.0 before evaluation.")
 
     # Optionally filter to perturbations seen in at least one training context
     if args.shared_only:
