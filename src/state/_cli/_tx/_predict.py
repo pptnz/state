@@ -237,7 +237,7 @@ def run_tx_predict(args: ap.ArgumentParser):
         **model_kwargs,
     }
 
-    model = ModelClass.load_from_checkpoint(checkpoint_path, **model_init_kwargs)
+    model = ModelClass.load_from_checkpoint(checkpoint_path, weights_only=False, **model_init_kwargs)
     model.eval()
     logger.info("Model loaded successfully.")
 
