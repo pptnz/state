@@ -21,8 +21,22 @@ def add_arguments_transform(parser: ap.ArgumentParser):
         ),
     )
     parser.add_argument("--input", required=True, help="Path to input anndata file (h5ad)")
-    parser.add_argument("--output", required=False, help="Path to output embedded anndata file (h5ad)")
-    parser.add_argument("--embed-key", default="X_state", help="Name of key to store embeddings")
+    parser.add_argument(
+        "--output",
+        required=False,
+        help=(
+            "Path to output file. If the filename ends with .h5ad, writes an embedded AnnData file with embeddings stored under "
+            "--embed-key. If the filename ends with .npy, writes only the embeddings matrix as a NumPy array (no .h5ad is written)."
+        ),
+    )
+    parser.add_argument(
+        "--embed-key",
+        default="X_state",
+        help=(
+            "Name of key to store embeddings in the output AnnData (when --output is .h5ad) and the embedding key used for "
+            "LanceDB storage (when --lancedb is set)."
+        ),
+    )
     parser.add_argument(
         "--protein-embeddings",
         required=False,
@@ -142,7 +156,9 @@ def run_emb_transform(args: ap.ArgumentParser):
     logger.info(f"Computing embeddings for {args.input}")
     if args.output:
         if save_as_npy:
-            logger.info(f"Output embeddings will be saved to {args.output} as a NumPy array")
+            logger.info(
+                f"Output will be saved to {args.output} as a NumPy array of embeddings only (no embedded .h5ad will be written)"
+            )
         else:
             logger.info(f"Output will be saved to {args.output}")
     if args.lancedb:
