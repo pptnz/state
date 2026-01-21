@@ -96,6 +96,7 @@ class ConfidenceToken(nn.Module):
 
         return main_output, confidence_pred
 
+
 class StateTransitionPerturbationModel(PerturbationModel):
     """
     This model:

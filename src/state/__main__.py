@@ -13,7 +13,6 @@ from ._cli import (
     run_emb_eval,
     run_tx_infer,
     run_tx_predict,
-    run_tx_preprocess_infer,
     run_tx_preprocess_train,
     run_tx_train,
 )
@@ -127,9 +126,6 @@ def main():
                 case "preprocess_train":
                     # Run preprocessing using argparse
                     run_tx_preprocess_train(args.adata, args.output, args.num_hvgs)
-                case "preprocess_infer":
-                    # Run inference preprocessing using argparse
-                    run_tx_preprocess_infer(args.adata, args.output, args.control_condition, args.pert_col, args.seed)
 
 
 if __name__ == "__main__":

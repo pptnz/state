@@ -145,9 +145,7 @@ def run_tx_predict(args: ap.ArgumentParser):
     if args.toml:
         data_section = cfg.get("data")
         if data_section is None or "kwargs" not in data_section:
-            raise KeyError(
-                "The loaded config does not contain data.kwargs, unable to override toml_config_path."
-            )
+            raise KeyError("The loaded config does not contain data.kwargs, unable to override toml_config_path.")
         cfg["data"]["kwargs"]["toml_config_path"] = args.toml
         logger.info("Overriding data.kwargs.toml_config_path to %s", args.toml)
 

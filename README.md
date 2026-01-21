@@ -111,7 +111,7 @@ Here, `/path/to/model/` is the folder downloaded from [HuggingFace](https://hugg
 
 ### Data Preprocessing
 
-State provides two preprocessing commands to prepare data for training and inference:
+State provides a preprocessing command to prepare data for training:
 
 #### Training Data Preprocessing
 
@@ -129,21 +129,6 @@ This command:
 - Applies log1p transformation (`sc.pp.log1p`) 
 - Identifies highly variable genes (`sc.pp.highly_variable_genes`)
 - Stores the HVG expression matrix in `.obsm['X_hvg']`
-
-#### Inference Data Preprocessing
-
-Use `preprocess_infer` to create a "control template" for model inference:
-
-```bash
-state tx preprocess_infer \
-  --adata /path/to/real_data.h5ad \
-  --output /path/to/control_template.h5ad \
-  --control_condition "DMSO" \
-  --pert_col "treatment" \
-  --seed 42
-```
-
-This command replaces all perturbed cells with control cell expression while preserving perturbation annotations. The resulting dataset serves as a baseline where `state_transition(control_template) ≈ original_data`, allowing you to evaluate how well the model reconstructs perturbation effects from control states.
 
 ## TOML Configuration Files
 

@@ -677,11 +677,9 @@ def run_tx_infer(args: argparse.Namespace):
         sim_obsm = X_in.astype(np.float32, copy=True)
         out_target = f"obsm['{writes_to[1]}']"
 
-    store_raw_expression = (
-        args.embed_key is not None
-        and args.embed_key != "X_hvg"
-        and output_space == "gene"
-    ) or (args.embed_key is not None and output_space == "all")
+    store_raw_expression = (args.embed_key is not None and args.embed_key != "X_hvg" and output_space == "gene") or (
+        args.embed_key is not None and output_space == "all"
+    )
     counts_expected = store_raw_expression
     counts_out_target: Optional[str] = None
     counts_obsm_key: Optional[str] = None
