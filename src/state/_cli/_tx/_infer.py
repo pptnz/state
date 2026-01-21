@@ -140,6 +140,12 @@ def run_tx_infer(args: argparse.Namespace):
             pass
         return np.asarray(mat)
 
+    def clip_array(arr, min_value: float = 0.0, max_value: float = 14.0) -> None:
+        """Clip array values in-place for stability in gene-space outputs."""
+        if arr is None:
+            return
+        np.clip(arr, min_value, max_value, out=arr)
+
     def pick_first_present(d: "sc.AnnData", candidates: List[str]) -> Optional[str]:
         for c in candidates:
             if c in d.obs:
@@ -671,19 +677,25 @@ def run_tx_infer(args: argparse.Namespace):
         sim_obsm = X_in.astype(np.float32, copy=True)
         out_target = f"obsm['{writes_to[1]}']"
 
-    counts_expected = output_space in {"gene", "all"}
+    store_raw_expression = (
+        args.embed_key is not None
+        and args.embed_key != "X_hvg"
+        and output_space == "gene"
+    ) or (args.embed_key is not None and output_space == "all")
+    counts_expected = store_raw_expression
     counts_out_target: Optional[str] = None
     counts_obsm_key: Optional[str] = None
     sim_counts: Optional[np.ndarray] = None
     counts_written = False
 
-    if output_space == "gene":
-        counts_out_target = "obsm['X_hvg']"
-        counts_obsm_key = "X_hvg"
-    elif output_space == "all":
-        counts_out_target = "X"
-        if writes_to[0] == ".X":
-            sim_counts = sim_X
+    if counts_expected:
+        if output_space == "gene":
+            counts_out_target = "obsm['X_hvg']"
+            counts_obsm_key = "X_hvg"
+        elif output_space == "all":
+            counts_out_target = "X"
+            if writes_to[0] == ".X":
+                sim_counts = sim_X
 
     # Group labels for set-to-set behavior
     if args.celltype_col and args.celltype_col in adata.obs:
@@ -786,7 +798,8 @@ def run_tx_infer(args: argparse.Namespace):
 
                     # 5) Choose output to write
                     if (
-                        writes_to[0] == ".X"
+                        counts_expected
+                        and writes_to[0] == ".X"
                         and ("pert_cell_counts_preds" in batch_out)
                         and (batch_out["pert_cell_counts_preds"] is not None)
                     ):
@@ -864,6 +877,25 @@ def run_tx_infer(args: argparse.Namespace):
                             out_target = f"obsm['{side_key}']"
 
                     start = end  # next window
+
+    # Clip gene-space predictions to keep downstream eval consistent.
+    if output_space in {"gene", "all"}:
+        if out_target == "X":
+            clip_array(sim_X)
+        elif out_target.startswith("obsm['") and out_target.endswith("']"):
+            pred_key = out_target[6:-2]
+            if writes_to[0] == ".obsm" and pred_key == writes_to[1]:
+                clip_array(sim_obsm)
+            elif pred_key in adata.obsm:
+                clip_array(adata.obsm[pred_key])
+        else:
+            if writes_to[0] == ".X":
+                clip_array(sim_X)
+            else:
+                clip_array(sim_obsm)
+
+        if counts_written and sim_counts is not None:
+            clip_array(sim_counts)
 
     # -----------------------
     # 5) Persist the updated AnnData
