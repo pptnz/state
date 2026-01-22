@@ -44,78 +44,17 @@ uv tool install -e .
 
 ## CLI Usage
 
-You can access the CLI help menu with:
-
-```state --help```
-
-Output:
-```
-usage: state [-h] {emb,tx} ...
-
-positional arguments:
-  {emb,tx}
-
-options:
-  -h, --help  show this help message and exit
-```
+If installed via `uv tool install`, run `state ...`. From source, run `uv run state ...`.
+Use `state --help` (or `state tx --help`, `state emb --help`) to see available subcommands.
 
 ## State Transition Model (ST)
 
-To start an experiment, write a TOML file (see `examples/zeroshot.toml` or
-`examples/fewshot.toml` to start). The TOML file specifies the dataset paths
-(containing h5ad files) as well as the machine learning task.
+Use `state tx` to train and run perturbation prediction models.
 
-Training an ST example below.
+### preprocess_train
 
-```bash
-state tx train \
-data.kwargs.toml_config_path="examples/fewshot.toml" \
-data.kwargs.embed_key=X_hvg \
-data.kwargs.num_workers=12 \
-data.kwargs.batch_col=batch_var \
-data.kwargs.pert_col=target_gene \
-data.kwargs.cell_type_key=cell_type \
-data.kwargs.control_pert=TARGET1 \
-training.max_steps=40000 \
-training.val_freq=100 \
-training.ckpt_every_n_steps=100 \
-training.batch_size=8 \
-training.lr=1e-4 \
-model.kwargs.cell_set_len=64 \
-model.kwargs.hidden_dim=328 \
-model=pertsets \
-wandb.tags="[test]" \
-output_dir="$HOME/state" \
-name="test"
-```
-
-The cell lines and perturbations specified in the TOML should match the values appearing in the
-`data.kwargs.cell_type_key` and `data.kwargs.pert_col` used above. To evaluate STATE on the specified task,
-you can use the `tx predict` command:
-
-```bash
-state tx predict --output-dir $HOME/state/test/ --checkpoint final.ckpt
-```
-
-It will look in the `output_dir` above, for a `checkpoints` folder.
-
-If you instead want to use a trained checkpoint for inference (e.g. on data not specified)
-in the TOML file:
-
-
-```bash
-state tx infer --output $HOME/state/test/ --output_dir /path/to/model/ --checkpoint /path/to/model/final.ckpt --adata /path/to/anndata/processed.h5 --pert_col gene --embed_key X_hvg
-```
-
-Here, `/path/to/model/` is the folder downloaded from [HuggingFace](https://huggingface.co/arcinstitute).
-
-### Data Preprocessing
-
-State provides a preprocessing command to prepare data for training:
-
-#### Training Data Preprocessing
-
-Use `preprocess_train` to normalize, log-transform, and select highly variable genes from your training data:
+Prepares training h5ad files by normalizing counts, applying log1p, and selecting highly variable genes (HVGs).
+The HVG matrix is stored in `.obsm["X_hvg"]`, and the output .h5ad is written to `--output`.
 
 ```bash
 state tx preprocess_train \
@@ -124,74 +63,67 @@ state tx preprocess_train \
   --num_hvgs 2000
 ```
 
-This command:
-- Normalizes total counts per cell (`sc.pp.normalize_total`)
-- Applies log1p transformation (`sc.pp.log1p`) 
-- Identifies highly variable genes (`sc.pp.highly_variable_genes`)
-- Stores the HVG expression matrix in `.obsm['X_hvg']`
+### train
 
-## TOML Configuration Files
+Trains an ST model using Hydra overrides. Point `data.kwargs.toml_config_path` at a TOML file that defines datasets and splits.
+`output_dir` and `name` define the run directory (`output_dir/name`).
 
-State experiments are configured using TOML files that define datasets, training splits, and evaluation scenarios. The configuration system supports both **zeroshot** (unseen cell types) and **fewshot** (limited perturbation examples) evaluation paradigms.
-
-### Configuration Structure
-
-#### Required Sections
-
-**`[datasets]`** - Maps dataset names to their file system paths
-```toml
-[datasets]
-replogle = "/path/to/replogle/dataset/"
-# YOU CAN ADD MORE
+```bash
+state tx train \
+  data.kwargs.toml_config_path=examples/fewshot.toml \
+  data.kwargs.embed_key=X_hvg \
+  data.kwargs.pert_col=target_gene \
+  data.kwargs.cell_type_key=cell_type \
+  training.max_steps=40000 \
+  training.batch_size=8 \
+  model=state \
+  output_dir="$HOME/state" \
+  name="test"
 ```
 
-**`[training]`** - Specifies which datasets participate in training
-```toml
-[training]
-replogle = "train"  # Include all replogle data in training (unless overridden below)
+### predict
+
+Evaluates a trained run with `cell-eval` metrics (or just runs prediction with `--predict-only`).
+`--output-dir` should point to the run directory that contains `config.yaml` and `checkpoints/`.
+
+```bash
+state tx predict --output-dir $HOME/state/test --checkpoint final.ckpt
 ```
 
-#### Optional Evaluation Sections
+Use `--toml` to evaluate on a different dataset/split config than the one saved in the run.
 
-**`[zeroshot]`** - Reserves entire cell types for validation/testing
-```toml
-[zeroshot]
-"replogle.jurkat" = "test"     # All jurkat cells go to test set
-"replogle.k562" = "val"        # All k562 cells go to validation set
+### infer
+
+Runs inference on new data (not necessarily in the training TOML). Provide the run directory via `--model-dir`
+and an input AnnData via `--adata`. Use `--embed-key X_hvg` if you trained on HVG features.
+
+```bash
+state tx infer \
+  --model-dir /path/to/run \
+  --checkpoint /path/to/run/checkpoints/final.ckpt \
+  --adata /path/to/preprocessed_data.h5ad \
+  --pert-col gene \
+  --embed-key X_hvg \
+  --output /path/to/output.h5ad
 ```
 
-**`[fewshot]`** - Specifies perturbation-level splits within cell types
+If `--output` ends with `.npy`, only the predictions matrix is written (no .h5ad).
+
+### ST TOML configuration
+
+The TOML file referenced by `data.kwargs.toml_config_path` defines dataset paths and splits.
+
+Required sections:
+- `[datasets]`: map dataset names to directories of h5ad files
+- `[training]`: select which datasets participate in training
+
+Optional sections:
+- `[zeroshot]`: hold out entire cell types for val/test
+- `[fewshot]`: hold out perturbations within specific cell types
+
+Minimal example:
+
 ```toml
-[fewshot]
-[fewshot."replogle.rpe1"]      # Configure splits for rpe1 cell type
-val = ["AARS", "TUFM"]         # These perturbations go to validation
-test = ["NUP107", "RPUSD4"]    # These perturbations go to test
-# Note: All other perturbations in rpe1 automatically go to training
-
-```
-
-### Configuration Examples
-
-#### Example 1: Pure Zeroshot Evaluation
-```toml
-# Evaluate generalization to completely unseen cell types
-[datasets]
-replogle = "/data/replogle/"
-
-[training]
-replogle = "train"
-
-[zeroshot]
-"replogle.jurkat" = "test"     # Hold out entire jurkat cell line
-"replogle.rpe1" = "val"        # Hold out entire rpe1 cell line
-
-[fewshot]
-# Empty - no perturbation-level splits
-```
-
-#### Example 2: Pure Fewshot Evaluation
-```toml
-# Evaluate with limited examples of specific perturbations
 [datasets]
 replogle = "/data/replogle/"
 
@@ -199,123 +131,125 @@ replogle = "/data/replogle/"
 replogle = "train"
 
 [zeroshot]
-# Empty - all cell types participate in training
+"replogle.jurkat" = "test"
 
 [fewshot]
 [fewshot."replogle.k562"]
-val = ["AARS"]                 # Limited AARS examples for validation
-test = ["NUP107", "RPUSD4"]    # Limited examples of these genes for testing
-
-[fewshot."replogle.jurkat"]
-val = ["TUFM"]
-test = ["MYC", "TP53"]
+val = ["AARS"]
+test = ["NUP107"]
 ```
 
-#### Example 3: Mixed Evaluation Strategy
-```toml
-# Combine both zeroshot and fewshot evaluation
-[datasets]
-replogle = "/data/replogle/"
+Notes:
+- Use the `"dataset.cell_type"` format in `[zeroshot]` and `[fewshot]`.
+- Anything not listed in `[zeroshot]`/`[fewshot]` defaults to training.
+- Dataset paths should point to directories containing h5ad files.
 
-[training]
-replogle = "train"
-
-[zeroshot]
-"replogle.jurkat" = "test"        # Zeroshot: unseen cell type
-
-[fewshot]
-[fewshot."replogle.k562"]      # Fewshot: limited perturbation examples
-val = ["STAT1"]
-test = ["MYC", "TP53"]
-```
-
-### Important Notes
-
-- **Automatic training assignment**: Any cell type not mentioned in `[zeroshot]` automatically participates in training, with perturbations not listed in `[fewshot]` going to the training set
-- **Overlapping splits**: Perturbations can appear in both validation and test sets within fewshot configurations
-- **Dataset naming**: Use the format `"dataset_name.cell_type"` when specifying cell types in zeroshot and fewshot sections
-- **Path requirements**: Dataset paths should point to directories containing h5ad files
-- **Control perturbations**: Ensure your control condition (specified via `control_pert` parameter) is available across all splits
-
-### Validation
-
-The configuration system will validate that:
-- All referenced datasets exist at the specified paths
-- Cell types mentioned in zeroshot/fewshot sections exist in the datasets
-- Perturbations listed in fewshot sections are present in the corresponding cell types
-- No conflicts exist between zeroshot and fewshot assignments for the same cell type
-
+See `examples/zeroshot.toml` and `examples/fewshot.toml` for more.
 
 ## State Embedding Model (SE)
 
-After following the same installation commands above:
+Use `state emb` to pretrain cell embeddings or embed new datasets.
+
+### preprocess (build a profile for your data)
+
+This scans your train/val datasets and creates a new embedding profile. It:
+- expects CSVs with `species,path,names` columns (each `names` value becomes a dataset id in the config)
+- auto-detects the gene-name field in `var` (checks `_index`, `gene_name`, `gene_symbols`, `feature_name`, `gene_id`, `symbol`)
+- uses `--all-embeddings` if provided (a torch dict of `{gene_name: embedding}`); otherwise builds one-hot embeddings
+- writes `all_embeddings_{profile}.pt`, `ds_emb_mapping_{profile}.torch`, `valid_genes_masks_{profile}.torch`,
+  plus `train_{profile}.csv` and `val_{profile}.csv` in `--output-dir`
+- updates the embeddings/dataset entries in the config file; it does not modify your h5ad files
+
+By default it updates `src/state/configs/state-defaults.yaml` unless you pass `--config-file`.
+
+Training on your own data (recommended workflow):
 
 ```bash
-state emb fit --conf ${CONFIG}
+cp src/state/configs/state-defaults.yaml my_state.yaml
+
+uv run state emb preprocess \
+  --profile-name my_data \
+  --train-csv /path/train.csv \
+  --val-csv /path/val.csv \
+  --output-dir /path/state_emb_profile \
+  --config-file my_state.yaml \
+  --all-embeddings /path/gene_embeddings.pt \
+  --num-threads 8
 ```
 
-To run inference with a trained State checkpoint, e.g., the State trained to 16 epochs:
+Example CSV format:
+
+```csv
+species,path,names
+human,/path/ds1.h5ad,ds1
+human,/path/ds2.h5ad,ds2
+```
+
+Tip: `--config-file` should point to a full config (copy `src/state/configs/state-defaults.yaml`), since preprocess only updates
+the embeddings/dataset sections.
+
+### fit
+
+Trains the embedding model. You must set `embeddings.current` and `dataset.current` to the profile created above.
+
+```bash
+uv run state emb fit --conf my_state.yaml \
+  embeddings.current=my_data \
+  dataset.current=my_data
+```
+
+You can override any training setting via Hydra (e.g., `experiment.num_gpus_per_node=4`).
+
+### transform
+
+Computes embeddings for a new dataset using a checkpoint. Provide either `--checkpoint` or `--model-folder`.
+`--output` is required unless you write directly to LanceDB.
 
 ```bash
 state emb transform \
-  --model-folder /large_storage/ctc/userspace/aadduri/SE-600M \
-  --checkpoint /large_storage/ctc/userspace/aadduri/SE-600M/se600m_epoch15.ckpt \
-  --input /large_storage/ctc/datasets/replogle/rpe1_raw_singlecell_01.h5ad \
-  --output /home/aadduri/vci_pretrain/test_output.h5ad
+  --model-folder /path/to/SE-600M \
+  --checkpoint /path/to/SE-600M/se600m_epoch15.ckpt \
+  --input /path/to/input.h5ad \
+  --output /path/to/output.h5ad
 ```
 
-Notes on the h5ad file format:
- - CSR matrix format is required
- - `gene_name` is required in the `var` dataframe
+If `--output` ends with `.npy`, only the embeddings matrix is written (no .h5ad is saved).
+Gene names are auto-detected from `var` (or `var.index`) based on overlap with the model's embeddings.
 
-### Vector Database
+### Vector Database (optional)
 
-Install the optional dependencies:
+Install optional dependencies:
 
 ```bash
 uv tool install ".[vectordb]"
 ```
 
-If working off a previous installation, you may need to run:
+If working off a previous installation, you may need:
 
 ```bash
 uv sync --extra vectordb
 ```
 
-#### Build the vector database
+Build a vector database:
 
 ```bash
 state emb transform \
-  --model-folder /large_storage/ctc/userspace/aadduri/SE-600M \
-  --input /large_storage/ctc/public/scBasecamp/GeneFull_Ex50pAS/GeneFull_Ex50pAS/Homo_sapiens/SRX27532045.h5ad \
-  --lancedb tmp/state_embeddings.lancedb \
-  --gene-column gene_symbols
+  --model-folder /path/to/SE-600M \
+  --input /path/to/dataset.h5ad \
+  --lancedb tmp/state_embeddings.lancedb
 ```
 
-Running this command multiple times with the same lancedb appends the new data to the provided database.
-
-#### Query the database
-
-Obtain the embeddings:
-
-```bash
-state emb transform \
-  --model-folder /large_storage/ctc/userspace/aadduri/SE-600M \
-  --input /large_storage/ctc/public/scBasecamp/GeneFull_Ex50pAS/GeneFull_Ex50pAS/Homo_sapiens/SRX27532046.h5ad \
-  --output tmp/SRX27532046.h5ad \
-  --gene-column gene_symbols
-```
-
-Query the database with the embeddings:
+Query the database:
 
 ```bash
 state emb query \
   --lancedb tmp/state_embeddings.lancedb \
-  --input tmp/SRX27532046.h5ad \
+  --input /path/to/query.h5ad \
   --output tmp/similar_cells.csv \
   --k 3
+```
 
-# Singularity
+## Singularity
 
 Containerization for STATE is available via the `singularity.def` file.
 
