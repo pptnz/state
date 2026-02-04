@@ -201,7 +201,7 @@ class PerturbationModel(ABC, LightningModule):
         self._build_decoder()
 
     def transfer_batch_to_device(self, batch, device, dataloader_idx: int):
-        return {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
+        return {k: (v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
 
     @abstractmethod
     def _build_networks(self):
