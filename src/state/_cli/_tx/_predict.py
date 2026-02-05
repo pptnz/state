@@ -58,11 +58,23 @@ def add_arguments_predict(parser: ap.ArgumentParser):
         help="If set, evaluate the model on the training data rather than on the test data.",
     )
 
+    parser.add_argument(
+        "--split-by-context",
+        action="store_true",
+        help=(
+            "If set, split predictions by context and write per-context adata_pred_{context}.h5ad and "
+            "adata_real_{context}.h5ad files using a bounded-memory two-pass strategy. "
+            "Uses dataset_name + cell_type when available, otherwise falls back to data.kwargs.cell_type_key."
+        ),
+    )
+
 
 def run_tx_predict(args: ap.ArgumentParser):
     import logging
     import os
     import sys
+    import tempfile
+    from collections import OrderedDict
 
     import anndata
     import lightning.pytorch as pl
@@ -136,6 +148,105 @@ def run_tx_predict(args: ap.ArgumentParser):
                     adata.X.eliminate_zeros()
         else:
             np.clip(adata.X, min_value, max_value, out=adata.X)
+
+    def infer_batch_size(batch: dict) -> int:
+        for key in ("pert_cell_emb", "pert_cell_counts", "ctrl_cell_emb", "batch", "pert_name", "cell_type"):
+            if key not in batch:
+                continue
+            value = batch[key]
+            if value is None:
+                continue
+            if isinstance(value, torch.Tensor):
+                return int(value.shape[0])
+            if isinstance(value, np.ndarray):
+                return int(value.shape[0]) if value.ndim > 0 else 1
+            if isinstance(value, (list, tuple)):
+                return len(value)
+        raise ValueError("Unable to infer batch size from batch contents.")
+
+    def normalize_batch_labels(values, batch_size: int):
+        if values is None:
+            return None
+        if isinstance(values, torch.Tensor):
+            values = values.detach().cpu().numpy()
+        if isinstance(values, np.ndarray):
+            if values.ndim == 2:
+                if values.shape[0] != batch_size:
+                    return None
+                if values.shape[1] == 1:
+                    flat = values.reshape(batch_size)
+                    return [str(x) for x in flat.tolist()]
+                indices = values.argmax(axis=1)
+                return [str(int(x)) for x in indices.tolist()]
+            if values.ndim == 1:
+                if values.shape[0] != batch_size:
+                    return None
+                return [str(x) for x in values.tolist()]
+            if values.ndim == 0:
+                return [str(values.item())] * batch_size
+            return None
+        if isinstance(values, (list, tuple)):
+            if len(values) != batch_size:
+                return None
+            normalized = []
+            for item in values:
+                if isinstance(item, torch.Tensor):
+                    item = item.detach().cpu().numpy()
+                if isinstance(item, np.ndarray):
+                    if item.ndim == 0:
+                        normalized.append(str(item.item()))
+                        continue
+                    if item.ndim == 1:
+                        if item.size == 1:
+                            normalized.append(str(item.item()))
+                        elif np.count_nonzero(item) == 1:
+                            normalized.append(str(int(item.argmax())))
+                        else:
+                            normalized.append(str(item.tolist()))
+                        continue
+                normalized.append(str(item))
+            return normalized
+        return [str(values)] * batch_size
+
+    def get_batch_labels(candidates, batch_size: int):
+        batch_labels = None
+        for candidate in candidates:
+            batch_labels = normalize_batch_labels(candidate, batch_size)
+            if batch_labels is not None:
+                break
+        if batch_labels is None:
+            batch_labels = ["None"] * batch_size
+        return batch_labels
+
+    def resolve_context_labels(batch: dict, batch_size: int, fallback):
+        dataset_labels = None
+        for key in ("dataset_name", "dataset"):
+            if key in batch and batch.get(key) is not None:
+                dataset_labels = normalize_batch_labels(batch.get(key), batch_size)
+                if dataset_labels is not None:
+                    break
+        context_labels = normalize_batch_labels(fallback, batch_size) if fallback is not None else None
+
+        if dataset_labels is not None and context_labels is not None:
+            combined = [f"{ds}.{ct}" for ds, ct in zip(dataset_labels, context_labels)]
+            return combined, "dataset_name+cell_type"
+        if context_labels is not None:
+            return context_labels, "cell_type"
+        return None, None
+
+    def ensure_list(values, batch_size: int):
+        if isinstance(values, list):
+            return values
+        if isinstance(values, tuple):
+            return list(values)
+        if isinstance(values, torch.Tensor):
+            values = values.detach().cpu().numpy()
+        if isinstance(values, np.ndarray):
+            if values.ndim == 0:
+                return [values.item()] * batch_size
+            return values.tolist()
+        return [values] * batch_size
+
 
     # 1. Load the config
     config_path = os.path.join(args.output_dir, "config.yaml")
@@ -268,14 +379,307 @@ def run_tx_predict(args: ap.ArgumentParser):
     logger.info("Generating predictions on test set using manual loop...")
     device = next(model.parameters()).device
 
-    final_preds = np.empty((num_cells, output_dim), dtype=np.float32)
-    final_reals = np.empty((num_cells, output_dim), dtype=np.float32)
+    cfg_batch_col = cfg.get("data", {}).get("kwargs", {}).get("batch_col", None)
+    batch_obs_key = cfg_batch_col or data_module.batch_col
 
     store_raw_expression = (
         data_module.embed_key is not None
         and data_module.embed_key != "X_hvg"
         and cfg["data"]["kwargs"]["output_space"] == "gene"
     ) or (data_module.embed_key is not None and cfg["data"]["kwargs"]["output_space"] == "all")
+
+    if args.split_by_context:
+        context_key = cfg.get("data", {}).get("kwargs", {}).get("cell_type_key", None) or data_module.cell_type_key
+        logger.info("Split-by-context enabled; counting cells per context.")
+
+        context_counts: OrderedDict[str, int] = OrderedDict()
+        context_order: list[str] = []
+        context_mode = None
+        for batch in tqdm(test_loader, desc="Counting contexts", unit="batch"):
+            batch_size = infer_batch_size(batch)
+            context_labels, detected_mode = resolve_context_labels(batch, batch_size, batch.get("cell_type"))
+            if context_labels is None:
+                raise ValueError(
+                    "split-by-context requires dataset_name + cell_type (preferred) or cell_type alone. "
+                    f"Check data.kwargs.cell_type_key (current: {context_key})."
+                )
+            if context_mode is None:
+                context_mode = detected_mode
+                logger.info("Split-by-context using '%s'.", context_mode)
+            elif detected_mode != context_mode:
+                raise ValueError(
+                    f"Inconsistent context source during counting: saw '{detected_mode}' after '{context_mode}'."
+                )
+            for label in context_labels:
+                if label not in context_counts:
+                    context_counts[label] = 0
+                    context_order.append(label)
+                context_counts[label] += 1
+
+        if len(context_counts) == 0:
+            logger.warning("No contexts found in test dataloader. Exiting.")
+            sys.exit(0)
+
+        context_slugs = {ctx: str(ctx).replace("/", "-") for ctx in context_order}
+
+        if args.eval_train_data:
+            results_dir = os.path.join(args.output_dir, "eval_train_" + os.path.basename(args.checkpoint))
+        else:
+            results_dir = os.path.join(args.output_dir, "eval_" + os.path.basename(args.checkpoint))
+        os.makedirs(results_dir, exist_ok=True)
+
+        tmp_dir = tempfile.TemporaryDirectory(prefix="predict_split_")
+        context_store = {}
+        for ctx in context_order:
+            ctx_slug = context_slugs[ctx]
+            ctx_count = context_counts[ctx]
+            preds_path = os.path.join(tmp_dir.name, f"{ctx_slug}_preds.mmap")
+            reals_path = os.path.join(tmp_dir.name, f"{ctx_slug}_reals.mmap")
+            preds_arr = np.memmap(preds_path, dtype=np.float32, mode="w+", shape=(ctx_count, output_dim))
+            reals_arr = np.memmap(reals_path, dtype=np.float32, mode="w+", shape=(ctx_count, output_dim))
+
+            x_hvg_arr = None
+            counts_pred_arr = None
+            if store_raw_expression:
+                if cfg["data"]["kwargs"]["output_space"] == "gene":
+                    x_hvg_shape = (ctx_count, hvg_dim)
+                else:
+                    x_hvg_shape = (ctx_count, gene_dim)
+                x_hvg_path = os.path.join(tmp_dir.name, f"{ctx_slug}_x_hvg.mmap")
+                counts_path = os.path.join(tmp_dir.name, f"{ctx_slug}_counts_pred.mmap")
+                x_hvg_arr = np.memmap(x_hvg_path, dtype=np.float32, mode="w+", shape=x_hvg_shape)
+                counts_pred_arr = np.memmap(counts_path, dtype=np.float32, mode="w+", shape=x_hvg_shape)
+
+            context_store[ctx] = {
+                "slug": ctx_slug,
+                "offset": 0,
+                "preds": preds_arr,
+                "reals": reals_arr,
+                "x_hvg": x_hvg_arr,
+                "counts_pred": counts_pred_arr,
+                "obs": {
+                    "pert_name": [],
+                    "celltype_name": [],
+                    "batch": [],
+                    "pert_cell_barcode": [],
+                    "ctrl_cell_barcode": [],
+                },
+            }
+
+        celltype_order: list = []
+        celltype_seen = set()
+
+        logger.info("Generating predictions on test set using split-by-context loop...")
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(tqdm(test_loader, desc="Predicting", unit="batch")):
+                batch = {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
+                batch_preds = model.predict_step(batch, batch_idx, padded=False)
+
+                batch_size = batch_preds["preds"].shape[0]
+                batch_labels = get_batch_labels(
+                    (
+                        batch.get("batch_name"),
+                        batch_preds.get("batch_name"),
+                        batch_preds.get("batch"),
+                    ),
+                    batch_size,
+                )
+
+                pert_names = ensure_list(batch_preds.get("pert_name"), batch_size)
+                celltypes = ensure_list(batch_preds.get("celltype_name"), batch_size)
+                if len(pert_names) != batch_size or len(celltypes) != batch_size:
+                    raise ValueError("Mismatch between batch size and pert/celltype metadata lengths.")
+                context_labels, detected_mode = resolve_context_labels(batch, batch_size, celltypes)
+                if context_labels is None:
+                    raise ValueError(
+                        "Unable to resolve context labels for split-by-context. "
+                        f"Expected {context_mode or 'cell_type'}."
+                    )
+                if detected_mode != context_mode:
+                    raise ValueError(
+                        f"Inconsistent context source during prediction: saw '{detected_mode}' after '{context_mode}'."
+                    )
+
+                for ct in celltypes:
+                    if ct not in celltype_seen:
+                        celltype_seen.add(ct)
+                        celltype_order.append(ct)
+
+                pert_barcodes = None
+                ctrl_barcodes = None
+                if "pert_cell_barcode" in batch_preds:
+                    pert_barcodes = ensure_list(batch_preds.get("pert_cell_barcode"), batch_size)
+                    ctrl_barcodes = ensure_list(batch_preds.get("ctrl_cell_barcode"), batch_size)
+
+                batch_pred_np = batch_preds["preds"].cpu().numpy().astype(np.float32)
+                batch_real_np = batch_preds["pert_cell_emb"].cpu().numpy().astype(np.float32)
+
+                batch_real_gene_np = None
+                batch_gene_pred_np = None
+                if store_raw_expression:
+                    batch_real_gene_np = batch_preds["pert_cell_counts"].cpu().numpy().astype(np.float32)
+                    batch_gene_pred_np = batch_preds["pert_cell_counts_preds"].cpu().numpy().astype(np.float32)
+
+                label_to_indices: dict[str, list[int]] = {}
+                for idx, label in enumerate(context_labels):
+                    label_to_indices.setdefault(label, []).append(idx)
+
+                for label, idxs in label_to_indices.items():
+                    if label not in context_store:
+                        raise ValueError(f"Encountered unseen context label '{label}' during prediction.")
+                    store = context_store[label]
+                    start = store["offset"]
+                    end = start + len(idxs)
+                    store["preds"][start:end, :] = batch_pred_np[idxs, :]
+                    store["reals"][start:end, :] = batch_real_np[idxs, :]
+                    if store_raw_expression:
+                        store["x_hvg"][start:end, :] = batch_real_gene_np[idxs, :]
+                        store["counts_pred"][start:end, :] = batch_gene_pred_np[idxs, :]
+                    store["obs"]["pert_name"].extend([pert_names[i] for i in idxs])
+                    store["obs"]["celltype_name"].extend([celltypes[i] for i in idxs])
+                    store["obs"]["batch"].extend([batch_labels[i] for i in idxs])
+                    if pert_barcodes is not None:
+                        store["obs"]["pert_cell_barcode"].extend([pert_barcodes[i] for i in idxs])
+                        store["obs"]["ctrl_cell_barcode"].extend([ctrl_barcodes[i] for i in idxs])
+                    store["offset"] = end
+
+        for ctx, store in context_store.items():
+            if store["offset"] != context_counts[ctx]:
+                logger.warning(
+                    "Context '%s' count mismatch: expected %d rows, wrote %d.",
+                    ctx,
+                    context_counts[ctx],
+                    store["offset"],
+                )
+
+        shared_perts = None
+        if args.shared_only:
+            try:
+                shared_perts = data_module.get_shared_perturbations()
+                if len(shared_perts) == 0:
+                    logger.warning("No shared perturbations between train and test; skipping filtering.")
+                    shared_perts = None
+            except Exception as e:
+                logger.warning(
+                    "Failed to resolve shared perturbations (%s). Proceeding without filter.",
+                    str(e),
+                )
+
+        context_adatas_pred = {}
+        context_adatas_real = {}
+        for ctx in context_order:
+            store = context_store[ctx]
+            obs_dict = {
+                data_module.pert_col: store["obs"]["pert_name"],
+                data_module.cell_type_key: store["obs"]["celltype_name"],
+                batch_obs_key: store["obs"]["batch"],
+            }
+            if data_module.batch_col and data_module.batch_col != batch_obs_key:
+                obs_dict[data_module.batch_col] = store["obs"]["batch"]
+            if len(store["obs"]["pert_cell_barcode"]) > 0:
+                obs_dict["pert_cell_barcode"] = store["obs"]["pert_cell_barcode"]
+                obs_dict["ctrl_cell_barcode"] = store["obs"]["ctrl_cell_barcode"]
+            obs = pd.DataFrame(obs_dict)
+
+            if store_raw_expression:
+                adata_pred = anndata.AnnData(X=store["counts_pred"], obs=obs)
+                adata_real = anndata.AnnData(X=store["x_hvg"], obs=obs)
+                adata_pred.obsm[data_module.embed_key] = store["preds"]
+                adata_real.obsm[data_module.embed_key] = store["reals"]
+            else:
+                adata_pred = anndata.AnnData(X=store["preds"], obs=obs)
+                adata_real = anndata.AnnData(X=store["reals"], obs=obs)
+
+            clip_anndata_values(adata_pred, max_value=14.0)
+            clip_anndata_values(adata_real, max_value=14.0)
+
+            if shared_perts is not None and len(shared_perts) > 0:
+                mask = adata_pred.obs[data_module.pert_col].isin(shared_perts)
+                before_n = adata_pred.n_obs
+                adata_pred = adata_pred[mask].copy()
+                adata_real = adata_real[mask].copy()
+                logger.info(
+                    "Context '%s': filtered cells %d -> %d (shared perturbations).",
+                    ctx,
+                    before_n,
+                    adata_pred.n_obs,
+                )
+
+            ctx_slug = store["slug"]
+            adata_pred_path = os.path.join(results_dir, f"adata_pred_{ctx_slug}.h5ad")
+            adata_real_path = os.path.join(results_dir, f"adata_real_{ctx_slug}.h5ad")
+            adata_pred.write_h5ad(adata_pred_path)
+            adata_real.write_h5ad(adata_real_path)
+            logger.info("Saved adata_pred to %s", adata_pred_path)
+            logger.info("Saved adata_real to %s", adata_real_path)
+
+            context_adatas_pred[ctx] = adata_pred
+            context_adatas_real[ctx] = adata_real
+
+        if not args.predict_only:
+            logger.info("Computing metrics using cell-eval...")
+            control_pert = data_module.get_control_pert()
+
+            for ct in celltype_order:
+                pred_parts = []
+                real_parts = []
+                for ctx in context_order:
+                    pred_ctx = context_adatas_pred[ctx]
+                    real_ctx = context_adatas_real[ctx]
+                    mask = pred_ctx.obs[data_module.cell_type_key] == ct
+                    if mask.any():
+                        pred_parts.append(pred_ctx[mask])
+                        real_parts.append(real_ctx[mask])
+
+                if len(pred_parts) == 0:
+                    continue
+
+                if len(pred_parts) == 1:
+                    pred_ct = pred_parts[0]
+                    real_ct = real_parts[0]
+                else:
+                    pred_ct = anndata.concat(pred_parts, merge="same")
+                    real_ct = anndata.concat(real_parts, merge="same")
+
+                pdex_kwargs = dict(exp_post_agg=True, is_log1p=True)
+                evaluator = MetricsEvaluator(
+                    adata_pred=pred_ct,
+                    adata_real=real_ct,
+                    control_pert=control_pert,
+                    pert_col=data_module.pert_col,
+                    outdir=results_dir,
+                    prefix=ct,
+                    pdex_kwargs=pdex_kwargs,
+                    batch_size=2048,
+                )
+
+                evaluator.compute(
+                    profile=args.profile,
+                    metric_configs={
+                        "discrimination_score": {
+                            "embed_key": data_module.embed_key,
+                        }
+                        if data_module.embed_key and data_module.embed_key != "X_hvg"
+                        else {},
+                        "pearson_edistance": {
+                            "embed_key": data_module.embed_key,
+                            "n_jobs": -1,  # set to all available cores
+                        }
+                        if data_module.embed_key and data_module.embed_key != "X_hvg"
+                        else {
+                            "n_jobs": -1,
+                        },
+                    }
+                    if data_module.embed_key and data_module.embed_key != "X_hvg"
+                    else {},
+                    skip_metrics=["pearson_edistance", "clustering_agreement"],
+                )
+
+        tmp_dir.cleanup()
+        return
+
+    final_preds = np.empty((num_cells, output_dim), dtype=np.float32)
+    final_reals = np.empty((num_cells, output_dim), dtype=np.float32)
 
     final_X_hvg = None
     final_pert_cell_counts_preds = None
@@ -329,63 +733,14 @@ def run_tx_predict(args: ap.ArgumentParser):
             batch_size = batch_preds["preds"].shape[0]
 
             # Handle gem_group - prefer human-readable batch names when available
-            def normalize_batch_labels(values):
-                if values is None:
-                    return None
-                if isinstance(values, torch.Tensor):
-                    values = values.detach().cpu().numpy()
-                if isinstance(values, np.ndarray):
-                    if values.ndim == 2:
-                        if values.shape[0] != batch_size:
-                            return None
-                        if values.shape[1] == 1:
-                            flat = values.reshape(batch_size)
-                            return [str(x) for x in flat.tolist()]
-                        indices = values.argmax(axis=1)
-                        return [str(int(x)) for x in indices.tolist()]
-                    if values.ndim == 1:
-                        if values.shape[0] != batch_size:
-                            return None
-                        return [str(x) for x in values.tolist()]
-                    if values.ndim == 0:
-                        return [str(values.item())] * batch_size
-                    return None
-                if isinstance(values, (list, tuple)):
-                    if len(values) != batch_size:
-                        return None
-                    normalized = []
-                    for item in values:
-                        if isinstance(item, torch.Tensor):
-                            item = item.detach().cpu().numpy()
-                        if isinstance(item, np.ndarray):
-                            if item.ndim == 0:
-                                normalized.append(str(item.item()))
-                                continue
-                            if item.ndim == 1:
-                                if item.size == 1:
-                                    normalized.append(str(item.item()))
-                                elif np.count_nonzero(item) == 1:
-                                    normalized.append(str(int(item.argmax())))
-                                else:
-                                    normalized.append(str(item.tolist()))
-                                continue
-                        normalized.append(str(item))
-                    return normalized
-                return [str(values)] * batch_size
-
-            batch_name_candidates = (
-                batch.get("batch_name"),
-                batch_preds.get("batch_name"),
-                batch_preds.get("batch"),
+            batch_labels = get_batch_labels(
+                (
+                    batch.get("batch_name"),
+                    batch_preds.get("batch_name"),
+                    batch_preds.get("batch"),
+                ),
+                batch_size,
             )
-
-            batch_labels = None
-            for candidate in batch_name_candidates:
-                batch_labels = normalize_batch_labels(candidate)
-                if batch_labels is not None:
-                    break
-            if batch_labels is None:
-                batch_labels = ["None"] * batch_size
             all_gem_groups.extend(batch_labels)
 
             batch_pred_np = batch_preds["preds"].cpu().numpy().astype(np.float32)
@@ -407,8 +762,6 @@ def run_tx_predict(args: ap.ArgumentParser):
     logger.info("Creating anndatas from predictions from manual loop...")
 
     # Build pandas DataFrame for obs and var
-    cfg_batch_col = cfg.get("data", {}).get("kwargs", {}).get("batch_col", None)
-    batch_obs_key = cfg_batch_col or data_module.batch_col
     print(batch_obs_key)
     df_dict = {
         data_module.pert_col: all_pert_names,
