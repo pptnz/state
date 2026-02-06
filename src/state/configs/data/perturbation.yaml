@@ -8,7 +8,8 @@ kwargs:
   num_workers: 12
   pin_memory: true
   n_basal_samples: 1
-  downsample: 1.0
+  downsample: null
+  downsample_cells: null
   additional_obs: []
   basal_mapping_strategy: random
   should_yield_control_cells: true
