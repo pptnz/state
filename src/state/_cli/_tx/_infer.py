@@ -33,7 +33,10 @@ def add_arguments_infer(parser: argparse.ArgumentParser):
         "--model-dir",
         type=str,
         required=True,
-        help="Path to the training run directory. Must contain config.yaml, var_dims.pkl, pert_onehot_map.pt, batch_onehot_map.pkl.",
+        help=(
+            "Path to the training run directory. Must contain config.yaml, var_dims.pkl, pert_onehot_map.pt, and "
+            "batch_onehot_map.torch (legacy batch_onehot_map.pkl is also supported)."
+        ),
     )
     parser.add_argument(
         "--celltype-col",
@@ -179,6 +182,26 @@ def run_tx_infer(args: argparse.Namespace):
         if isinstance(v, (int, np.integer)):
             return int(v)
         return None
+
+    def load_batch_onehot_map(model_dir: str):
+        candidates = [
+            "batch_onehot_map.torch",
+            "batch_onehot_map.pt",
+            "batch_onehot_map.pkl",
+        ]
+        resolved_paths = [os.path.join(model_dir, name) for name in candidates]
+        for path in resolved_paths:
+            if not os.path.exists(path):
+                continue
+            if path.endswith(".pkl"):
+                with open(path, "rb") as f:
+                    mapping = pickle.load(f)
+            else:
+                mapping = torch.load(path, map_location="cpu", weights_only=False)
+            if not isinstance(mapping, dict):
+                raise TypeError(f"Expected dict in {path}, got {type(mapping).__name__}")
+            return mapping, path, resolved_paths
+        return None, None, resolved_paths
 
     def prepare_batch(
         ctrl_basal_np: np.ndarray,
@@ -394,11 +417,9 @@ def run_tx_infer(args: argparse.Namespace):
     pert_name_lookup: Dict[str, object] = {str(k): k for k in pert_onehot_map.keys()}
     pert_names_in_map: List[str] = list(pert_name_lookup.keys())
 
-    batch_onehot_map_path = os.path.join(args.model_dir, "batch_onehot_map.pkl")
-    batch_onehot_map = None
-    if os.path.exists(batch_onehot_map_path):
-        with open(batch_onehot_map_path, "rb") as f:
-            batch_onehot_map = pickle.load(f)
+    batch_onehot_map, loaded_batch_onehot_map_path, batch_onehot_map_candidates = load_batch_onehot_map(args.model_dir)
+    if loaded_batch_onehot_map_path is not None and not args.quiet:
+        print(f"Loaded batch one-hot map from: {loaded_batch_onehot_map_path}")
 
     # -----------------------
     # 2) Load model
@@ -626,7 +647,9 @@ def run_tx_infer(args: argparse.Namespace):
             raw_labels = adata.obs[batch_col].astype(str).values
             if batch_onehot_map is None:
                 warnings.warn(
-                    f"Model has a batch encoder, but '{batch_onehot_map_path}' not found. "
+                    "Model has a batch encoder, but no batch one-hot map was found at any of: "
+                    + ", ".join(batch_onehot_map_candidates)
+                    + ". "
                     "Batch info will be ignored; predictions may degrade."
                 )
                 uses_batch_encoder = False

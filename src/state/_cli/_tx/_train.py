@@ -152,17 +152,16 @@ def run_tx_train(cfg: DictConfig):
         cfg["model"]["kwargs"].pop("decoder_cfg", None)
         cfg["model"]["kwargs"]["gene_decoder_bool"] = False
 
-    # Save the onehot maps as pickle files instead of storing in config
+    # Save one-hot maps as artifacts instead of storing them in config
     cell_type_onehot_map_path = join(run_output_dir, "cell_type_onehot_map.pkl")
     pert_onehot_map_path = join(run_output_dir, "pert_onehot_map.pt")
-    batch_onehot_map_path = join(run_output_dir, "batch_onehot_map.pkl")
+    batch_onehot_map_path = join(run_output_dir, "batch_onehot_map.torch")
     var_dims_path = join(run_output_dir, "var_dims.pkl")
 
     with open(cell_type_onehot_map_path, "wb") as f:
         pickle.dump(data_module.cell_type_onehot_map, f)
     torch.save(data_module.pert_onehot_map, pert_onehot_map_path)
-    with open(batch_onehot_map_path, "wb") as f:
-        pickle.dump(data_module.batch_onehot_map, f)
+    torch.save(data_module.batch_onehot_map, batch_onehot_map_path)
     with open(var_dims_path, "wb") as f:
         pickle.dump(var_dims, f)
 
