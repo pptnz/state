@@ -57,6 +57,15 @@ def add_arguments_predict(parser: ap.ArgumentParser):
         action="store_true",
         help="If set, skip DE computation in cell-eval and only compute AnnData-based metrics.",
     )
+    parser.add_argument(
+        "--fix-cells",
+        type=int,
+        default=None,
+        help=(
+            "If set to a positive int, resample each perturbation condition to this "
+            "many cells before DE computation (0 or None disables)."
+        ),
+    )
 
     parser.add_argument(
         "--shared-only",
@@ -645,6 +654,7 @@ def run_tx_predict(args: ap.ArgumentParser):
                     pdex_kwargs=pdex_kwargs,
                     batch_size=2048,
                     skip_de=args.skip_de,
+                    fix_cells=args.fix_cells,
                 )
                 evaluator.compute(
                     profile=args.profile,
@@ -880,6 +890,7 @@ def run_tx_predict(args: ap.ArgumentParser):
                 pdex_kwargs=pdex_kwargs,
                 batch_size=2048,
                 skip_de=args.skip_de,
+                fix_cells=args.fix_cells,
             )
 
             evaluator.compute(
