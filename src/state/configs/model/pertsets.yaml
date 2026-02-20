@@ -18,7 +18,6 @@ kwargs:
   residual_decoder: False # if true, the pretrained state decoder is used in finetuning
   batch_encoder: False # if true, batch variables are used
   use_batch_token: False # if true, batch token is appended to the sequence
-  nb_decoder: False # if true, use a negative binomial decoder
   decoder_loss_weight: 1.0
   use_basal_projection: False
   mask_attn: False # if true, mask the attention

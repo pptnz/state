@@ -12,7 +12,6 @@ from typing import Dict, Optional, Tuple
 
 from .base import PerturbationModel
 from .decoders import FinetuneVCICountsDecoder
-from .decoders_nb import NBDecoder, nb_nll
 from .utils import build_mlp, get_activation_class, get_transformer_backbone, apply_lora
 
 
@@ -306,14 +305,6 @@ class StateTransitionPerturbationModel(PerturbationModel):
             # Freeze projection head as before
             for param in self.project_out.parameters():
                 param.requires_grad = False
-
-        if kwargs.get("nb_decoder", False):
-            self.gene_decoder = NBDecoder(
-                latent_dim=self.output_dim + (self.batch_dim or 0),
-                gene_dim=gene_dim,
-                hidden_dims=[512, 512, 512],
-                dropout=self.dropout,
-            )
 
         control_pert = kwargs.get("control_pert", "non-targeting")
         if kwargs.get("finetune_vci_decoder", False):  # TODO: This will go very soon
@@ -646,19 +637,14 @@ class StateTransitionPerturbationModel(PerturbationModel):
             else:
                 latent_preds = pred
 
-            if isinstance(self.gene_decoder, NBDecoder):
-                mu, theta = self.gene_decoder(latent_preds)
-                gene_targets = batch["pert_cell_counts"].reshape_as(mu)
-                decoder_loss = nb_nll(gene_targets, mu, theta)
+            pert_cell_counts_preds = self.gene_decoder(latent_preds)
+            if padded:
+                gene_targets = gene_targets.reshape(-1, self.cell_sentence_len, self.gene_decoder.gene_dim())
             else:
-                pert_cell_counts_preds = self.gene_decoder(latent_preds)
-                if padded:
-                    gene_targets = gene_targets.reshape(-1, self.cell_sentence_len, self.gene_decoder.gene_dim())
-                else:
-                    gene_targets = gene_targets.reshape(1, -1, self.gene_decoder.gene_dim())
+                gene_targets = gene_targets.reshape(1, -1, self.gene_decoder.gene_dim())
 
-                decoder_per_set = self._compute_distribution_loss(pert_cell_counts_preds, gene_targets)
-                decoder_loss = decoder_per_set.mean()
+            decoder_per_set = self._compute_distribution_loss(pert_cell_counts_preds, gene_targets)
+            decoder_loss = decoder_per_set.mean()
 
             # Log decoder loss
             self.log("decoder_loss", decoder_loss)
@@ -724,18 +710,12 @@ class StateTransitionPerturbationModel(PerturbationModel):
             latent_preds = pred
 
             # Train decoder to map latent predictions to gene space
-            if isinstance(self.gene_decoder, NBDecoder):
-                mu, theta = self.gene_decoder(latent_preds)
-                gene_targets = batch["pert_cell_counts"].reshape_as(mu)
-                decoder_loss = nb_nll(gene_targets, mu, theta)
-            else:
-                # Get decoder predictions
-                pert_cell_counts_preds = self.gene_decoder(latent_preds).reshape(
-                    -1, self.cell_sentence_len, self.gene_decoder.gene_dim()
-                )
-                gene_targets = gene_targets.reshape(-1, self.cell_sentence_len, self.gene_decoder.gene_dim())
-                decoder_per_set = self._compute_distribution_loss(pert_cell_counts_preds, gene_targets)
-                decoder_loss = decoder_per_set.mean()
+            pert_cell_counts_preds = self.gene_decoder(latent_preds).reshape(
+                -1, self.cell_sentence_len, self.gene_decoder.gene_dim()
+            )
+            gene_targets = gene_targets.reshape(-1, self.cell_sentence_len, self.gene_decoder.gene_dim())
+            decoder_per_set = self._compute_distribution_loss(pert_cell_counts_preds, gene_targets)
+            decoder_loss = decoder_per_set.mean()
 
             # Log the validation metric
             self.log("val/decoder_loss", decoder_loss)
@@ -809,11 +789,7 @@ class StateTransitionPerturbationModel(PerturbationModel):
             output_dict["confidence_pred"] = confidence_pred
 
         if self.gene_decoder is not None:
-            if isinstance(self.gene_decoder, NBDecoder):
-                mu, _ = self.gene_decoder(latent_output)
-                pert_cell_counts_preds = mu
-            else:
-                pert_cell_counts_preds = self.gene_decoder(latent_output)
+            pert_cell_counts_preds = self.gene_decoder(latent_output)
 
             output_dict["pert_cell_counts_preds"] = pert_cell_counts_preds
 
