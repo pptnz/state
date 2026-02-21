@@ -81,6 +81,10 @@ state tx train \
   name="test"
 ```
 
+Optional downsampling overrides:
+- `data.kwargs.downsample` downsample counts during loading (`<=1` keeps that fraction by binomial sampling, `>1` targets that read depth per cell for `output_space=all`).
+- `data.kwargs.downsample_cells` caps the number of cells loaded per `(cell_type, perturbation[, batch])` group while leaving smaller groups unchanged.
+
 ### predict
 
 Evaluates a trained run with `cell-eval` metrics (or just runs prediction with `--predict-only`).
