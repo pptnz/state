@@ -17,5 +17,6 @@ kwargs:
   k562_rpe1_name: replogle_k562_rpe1_filtered
   jurkat_name: replogle_jurkat_filtered
   hepg2_name: replogle_hepg2_filtered
+  use_consecutive_loading: false
 output_dir: null
 debug: true

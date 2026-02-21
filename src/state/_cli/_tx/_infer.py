@@ -33,7 +33,11 @@ def add_arguments_infer(parser: argparse.ArgumentParser):
         "--model-dir",
         type=str,
         required=True,
-        help="Path to the training run directory. Must contain config.yaml, var_dims.pkl, pert_onehot_map.pt, batch_onehot_map.pkl.",
+        help=(
+            "Path to the training run directory. Must contain config.yaml, var_dims.pkl, pert_onehot_map.pt, and "
+            "batch_onehot_map.torch (legacy batch_onehot_map.pkl is also supported). "
+            "cell_type_onehot_map.torch is optional (legacy cell_type_onehot_map.pkl is also supported)."
+        ),
     )
     parser.add_argument(
         "--celltype-col",
@@ -179,6 +183,26 @@ def run_tx_infer(args: argparse.Namespace):
         if isinstance(v, (int, np.integer)):
             return int(v)
         return None
+
+    def load_onehot_map(model_dir: str, basename: str):
+        candidates = [
+            f"{basename}.torch",
+            f"{basename}.pt",
+            f"{basename}.pkl",
+        ]
+        resolved_paths = [os.path.join(model_dir, name) for name in candidates]
+        for path in resolved_paths:
+            if not os.path.exists(path):
+                continue
+            if path.endswith(".pkl"):
+                with open(path, "rb") as f:
+                    mapping = pickle.load(f)
+            else:
+                mapping = torch.load(path, map_location="cpu", weights_only=False)
+            if not isinstance(mapping, dict):
+                raise TypeError(f"Expected dict in {path}, got {type(mapping).__name__}")
+            return mapping, path, resolved_paths
+        return None, None, resolved_paths
 
     def prepare_batch(
         ctrl_basal_np: np.ndarray,
@@ -394,11 +418,14 @@ def run_tx_infer(args: argparse.Namespace):
     pert_name_lookup: Dict[str, object] = {str(k): k for k in pert_onehot_map.keys()}
     pert_names_in_map: List[str] = list(pert_name_lookup.keys())
 
-    batch_onehot_map_path = os.path.join(args.model_dir, "batch_onehot_map.pkl")
-    batch_onehot_map = None
-    if os.path.exists(batch_onehot_map_path):
-        with open(batch_onehot_map_path, "rb") as f:
-            batch_onehot_map = pickle.load(f)
+    batch_onehot_map, loaded_batch_onehot_map_path, batch_onehot_map_candidates = load_onehot_map(
+        args.model_dir, "batch_onehot_map"
+    )
+    if loaded_batch_onehot_map_path is not None and not args.quiet:
+        print(f"Loaded batch one-hot map from: {loaded_batch_onehot_map_path}")
+    cell_type_onehot_map, loaded_cell_type_onehot_map_path, _ = load_onehot_map(args.model_dir, "cell_type_onehot_map")
+    if loaded_cell_type_onehot_map_path is not None and not args.quiet:
+        print(f"Loaded cell type one-hot map from: {loaded_cell_type_onehot_map_path}")
 
     # -----------------------
     # 2) Load model
@@ -448,6 +475,17 @@ def run_tx_infer(args: argparse.Namespace):
     # optional filter by cell types
     if args.celltype_col and args.celltypes:
         keep_cts = [ct.strip() for ct in args.celltypes.split(",")]
+        if cell_type_onehot_map is not None:
+            available_cell_types = {str(k) for k in cell_type_onehot_map.keys()}
+            missing_in_map = [ct for ct in keep_cts if ct not in available_cell_types]
+            if missing_in_map and not args.quiet:
+                preview = ", ".join(missing_in_map[:5])
+                if len(missing_in_map) > 5:
+                    preview += ", ..."
+                print(
+                    f"Warning: {len(missing_in_map)} requested cell types not found in saved mapping "
+                    f"(examples: {preview})."
+                )
         if args.celltype_col not in adata.obs:
             raise ValueError(f"Column '{args.celltype_col}' not in adata.obs")
         n0 = adata.n_obs
@@ -626,7 +664,9 @@ def run_tx_infer(args: argparse.Namespace):
             raw_labels = adata.obs[batch_col].astype(str).values
             if batch_onehot_map is None:
                 warnings.warn(
-                    f"Model has a batch encoder, but '{batch_onehot_map_path}' not found. "
+                    "Model has a batch encoder, but no batch one-hot map was found at any of: "
+                    + ", ".join(batch_onehot_map_candidates)
+                    + ". "
                     "Batch info will be ignored; predictions may degrade."
                 )
                 uses_batch_encoder = False

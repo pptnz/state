@@ -157,7 +157,9 @@ class FinetuneVCICountsDecoder(nn.Module):
         use_rda = getattr(self.finetune.model.cfg.model, "rda", False)
         task_counts = None
         if use_rda:
-            task_counts = torch.full((cell_embeds.shape[0],), self.read_depth.item(), device=cell_embeds.device)
+            task_counts = self.read_depth.expand(cell_embeds.shape[0])
+            if task_counts.device != cell_embeds.device:
+                task_counts = task_counts.to(cell_embeds.device)
 
         # Binary decoder forward with safe dtype handling.
         # - On CUDA: enable bf16 autocast for speed.

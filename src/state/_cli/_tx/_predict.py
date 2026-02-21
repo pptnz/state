@@ -47,6 +47,12 @@ def add_arguments_predict(parser: ap.ArgumentParser):
     )
 
     parser.add_argument(
+        "--skip-adatas",
+        action="store_true",
+        help="If set, skip writing AnnData (.h5ad) outputs and only run metrics/evaluation.",
+    )
+
+    parser.add_argument(
         "--shared-only",
         action="store_true",
         help=("If set, restrict predictions/evaluation to perturbations shared between train and test (train ∩ test)."),
@@ -56,6 +62,15 @@ def add_arguments_predict(parser: ap.ArgumentParser):
         "--eval-train-data",
         action="store_true",
         help="If set, evaluate the model on the training data rather than on the test data.",
+    )
+
+    parser.add_argument(
+        "--pseudobulk",
+        action="store_true",
+        help=(
+            "If set, aggregate predictions in a streaming fashion into running pseudobulks by "
+            "(context, perturbation) before cell-eval."
+        ),
     )
 
 
@@ -77,11 +92,15 @@ def run_tx_predict(args: ap.ArgumentParser):
     from cell_eval.utils import split_anndata_on_celltype
     from cell_load.data_modules import PerturbationDataModule
     from tqdm import tqdm
+    from ._utils import normalize_batch_labels
 
     logging.basicConfig(level=logging.INFO)
     logger = logging.getLogger(__name__)
 
     torch.multiprocessing.set_sharing_strategy("file_system")
+
+    if args.predict_only and args.skip_adatas:
+        logger.warning("Both --predict-only and --skip-adatas were set; no prediction artifacts will be written.")
 
     def run_test_time_finetune(model, dataloader, ft_epochs, control_pert, device):
         """
@@ -136,6 +155,45 @@ def run_tx_predict(args: ap.ArgumentParser):
                     adata.X.eliminate_zeros()
         else:
             np.clip(adata.X, min_value, max_value, out=adata.X)
+
+    def get_batch_labels(candidates, batch_size: int):
+        batch_labels = None
+        for candidate in candidates:
+            batch_labels = normalize_batch_labels(candidate, batch_size)
+            if batch_labels is not None:
+                break
+        if batch_labels is None:
+            batch_labels = ["None"] * batch_size
+        return batch_labels
+
+    def resolve_context_labels(batch: dict, batch_size: int, fallback):
+        dataset_labels = None
+        for key in ("dataset_name", "dataset"):
+            if key in batch and batch.get(key) is not None:
+                dataset_labels = normalize_batch_labels(batch.get(key), batch_size)
+                if dataset_labels is not None:
+                    break
+        context_labels = normalize_batch_labels(fallback, batch_size) if fallback is not None else None
+
+        if dataset_labels is not None and context_labels is not None:
+            combined = [f"{ds}.{ct}" for ds, ct in zip(dataset_labels, context_labels)]
+            return combined, "dataset_name+cell_type"
+        if context_labels is not None:
+            return context_labels, "cell_type"
+        return None, None
+
+    def ensure_list(values, batch_size: int):
+        if isinstance(values, list):
+            return values
+        if isinstance(values, tuple):
+            return list(values)
+        if isinstance(values, torch.Tensor):
+            values = values.detach().cpu().numpy()
+        if isinstance(values, np.ndarray):
+            if values.ndim == 0:
+                return [values.item()] * batch_size
+            return values.tolist()
+        return [values] * batch_size
 
     # 1. Load the config
     config_path = os.path.join(args.output_dir, "config.yaml")
@@ -236,7 +294,8 @@ def run_tx_predict(args: ap.ArgumentParser):
     logger.info("Model loaded successfully.")
 
     # 4. Test-time fine-tuning if requested
-    data_module.batch_size = 1
+    if args.test_time_finetune > 0:
+        data_module.batch_size = 1
     if args.test_time_finetune > 0:
         control_pert = data_module.get_control_pert()
         if args.eval_train_data:
@@ -268,14 +327,284 @@ def run_tx_predict(args: ap.ArgumentParser):
     logger.info("Generating predictions on test set using manual loop...")
     device = next(model.parameters()).device
 
-    final_preds = np.empty((num_cells, output_dim), dtype=np.float32)
-    final_reals = np.empty((num_cells, output_dim), dtype=np.float32)
+    cfg_batch_col = cfg.get("data", {}).get("kwargs", {}).get("batch_col", None)
+    batch_obs_key = cfg_batch_col or data_module.batch_col
+    if batch_obs_key is None:
+        batch_obs_key = "batch"
 
     store_raw_expression = (
         data_module.embed_key is not None
         and data_module.embed_key != "X_hvg"
         and cfg["data"]["kwargs"]["output_space"] == "gene"
     ) or (data_module.embed_key is not None and cfg["data"]["kwargs"]["output_space"] == "all")
+
+    if args.pseudobulk:
+        logger.info("Pseudobulk enabled; aggregating running means by (context, perturbation).")
+
+        if args.eval_train_data:
+            results_dir = os.path.join(args.output_dir, "eval_train_" + os.path.basename(args.checkpoint))
+        else:
+            results_dir = os.path.join(args.output_dir, "eval_" + os.path.basename(args.checkpoint))
+        os.makedirs(results_dir, exist_ok=True)
+
+        pseudo_x_dim = None
+        if store_raw_expression:
+            if cfg["data"]["kwargs"]["output_space"] == "gene":
+                pseudo_x_dim = hvg_dim
+            elif cfg["data"]["kwargs"]["output_space"] == "all":
+                pseudo_x_dim = gene_dim
+            else:
+                raise ValueError(f"Unsupported output_space for pseudobulk: {cfg['data']['kwargs']['output_space']}")
+
+        pb_groups: dict[tuple[str, str], dict] = {}
+        context_mode = None
+        total_cells_seen = 0
+
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(tqdm(test_loader, desc="Predicting", unit="batch")):
+                batch = {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
+                batch_preds = model.predict_step(batch, batch_idx, padded=False)
+
+                batch_size = batch_preds["preds"].shape[0]
+                total_cells_seen += batch_size
+
+                batch_labels = get_batch_labels(
+                    (
+                        batch.get("batch_name"),
+                        batch_preds.get("batch_name"),
+                        batch_preds.get("batch"),
+                    ),
+                    batch_size,
+                )
+
+                pert_names = [str(x) for x in ensure_list(batch_preds.get("pert_name"), batch_size)]
+                celltypes = [str(x) for x in ensure_list(batch_preds.get("celltype_name"), batch_size)]
+                if len(pert_names) != batch_size or len(celltypes) != batch_size:
+                    raise ValueError("Mismatch between batch size and pert/celltype metadata lengths.")
+
+                context_labels, detected_mode = resolve_context_labels(batch, batch_size, celltypes)
+                if context_labels is None:
+                    raise ValueError(
+                        "pseudobulk requires dataset_name + cell_type (preferred) or cell_type alone. "
+                        f"Check data.kwargs.cell_type_key (current: {data_module.cell_type_key})."
+                    )
+                context_labels = [str(x) for x in context_labels]
+                if context_mode is None:
+                    context_mode = detected_mode
+                    logger.info("Pseudobulk context source: %s", context_mode)
+                elif detected_mode != context_mode:
+                    raise ValueError(
+                        f"Inconsistent context source during prediction: saw '{detected_mode}' after '{context_mode}'."
+                    )
+
+                batch_pred_np = batch_preds["preds"].cpu().numpy().astype(np.float32)
+                batch_real_np = batch_preds["pert_cell_emb"].cpu().numpy().astype(np.float32)
+
+                batch_real_gene_np = None
+                batch_gene_pred_np = None
+                if store_raw_expression:
+                    batch_real_gene_np = batch_preds["pert_cell_counts"].cpu().numpy().astype(np.float32)
+                    batch_gene_pred_np = batch_preds["pert_cell_counts_preds"].cpu().numpy().astype(np.float32)
+
+                group_to_indices: dict[tuple[str, str], list[int]] = {}
+                for idx in range(batch_size):
+                    key = (context_labels[idx], pert_names[idx])
+                    group_to_indices.setdefault(key, []).append(idx)
+
+                for (context_label, pert_name), idxs in group_to_indices.items():
+                    idx_arr = np.asarray(idxs, dtype=np.int64)
+                    first_idx = int(idx_arr[0])
+                    current_celltype = celltypes[first_idx]
+                    current_batch = str(batch_labels[first_idx])
+
+                    entry = pb_groups.get((context_label, pert_name))
+                    if entry is None:
+                        entry = {
+                            "context": context_label,
+                            "pert_name": pert_name,
+                            "celltype_name": current_celltype,
+                            "batch_name": current_batch,
+                            "count": 0,
+                            "pred_sum": np.zeros(output_dim, dtype=np.float64),
+                            "real_sum": np.zeros(output_dim, dtype=np.float64),
+                            "x_hvg_sum": np.zeros(pseudo_x_dim, dtype=np.float64) if store_raw_expression else None,
+                            "counts_pred_sum": (
+                                np.zeros(pseudo_x_dim, dtype=np.float64) if store_raw_expression else None
+                            ),
+                        }
+                        pb_groups[(context_label, pert_name)] = entry
+                    elif entry["celltype_name"] != current_celltype:
+                        raise ValueError(
+                            f"Inconsistent cell type for context/pert pair ({context_label}, {pert_name}): "
+                            f"saw '{current_celltype}' after '{entry['celltype_name']}'."
+                        )
+
+                    entry["count"] += int(idx_arr.size)
+                    entry["pred_sum"] += batch_pred_np[idx_arr].sum(axis=0, dtype=np.float64)
+                    entry["real_sum"] += batch_real_np[idx_arr].sum(axis=0, dtype=np.float64)
+                    if store_raw_expression:
+                        entry["x_hvg_sum"] += batch_real_gene_np[idx_arr].sum(axis=0, dtype=np.float64)
+                        entry["counts_pred_sum"] += batch_gene_pred_np[idx_arr].sum(axis=0, dtype=np.float64)
+
+        if len(pb_groups) == 0:
+            logger.warning("No pseudobulk groups were generated. Exiting.")
+            sys.exit(0)
+
+        logger.info(
+            "Built %d pseudobulk groups from %d cells.",
+            len(pb_groups),
+            total_cells_seen,
+        )
+
+        group_entries = list(pb_groups.values())
+        group_entries.sort(key=lambda x: (str(x["celltype_name"]), str(x["context"]), str(x["pert_name"])))
+        n_groups = len(group_entries)
+
+        pred_bulk = np.empty((n_groups, output_dim), dtype=np.float32)
+        real_bulk = np.empty((n_groups, output_dim), dtype=np.float32)
+        pred_x = np.empty((n_groups, pseudo_x_dim), dtype=np.float32) if store_raw_expression else None
+        real_x = np.empty((n_groups, pseudo_x_dim), dtype=np.float32) if store_raw_expression else None
+
+        reserved_obs_keys = {
+            str(data_module.pert_col),
+            str(data_module.cell_type_key),
+            str(batch_obs_key),
+        }
+        if data_module.batch_col:
+            reserved_obs_keys.add(str(data_module.batch_col))
+
+        pseudobulk_context_key = "pseudobulk_context"
+        while pseudobulk_context_key in reserved_obs_keys:
+            pseudobulk_context_key = f"_{pseudobulk_context_key}"
+        pseudobulk_n_cells_key = "pseudobulk_n_cells"
+        while pseudobulk_n_cells_key in reserved_obs_keys or pseudobulk_n_cells_key == pseudobulk_context_key:
+            pseudobulk_n_cells_key = f"_{pseudobulk_n_cells_key}"
+
+        obs_dict = {
+            data_module.pert_col: [],
+            data_module.cell_type_key: [],
+            batch_obs_key: [],
+            pseudobulk_context_key: [],
+            pseudobulk_n_cells_key: [],
+        }
+        if data_module.batch_col and data_module.batch_col != batch_obs_key:
+            obs_dict[data_module.batch_col] = []
+
+        for idx, entry in enumerate(group_entries):
+            count = int(entry["count"])
+            denom = float(count)
+            pred_bulk[idx, :] = (entry["pred_sum"] / denom).astype(np.float32, copy=False)
+            real_bulk[idx, :] = (entry["real_sum"] / denom).astype(np.float32, copy=False)
+            if store_raw_expression:
+                pred_x[idx, :] = (entry["counts_pred_sum"] / denom).astype(np.float32, copy=False)
+                real_x[idx, :] = (entry["x_hvg_sum"] / denom).astype(np.float32, copy=False)
+
+            obs_dict[data_module.pert_col].append(entry["pert_name"])
+            obs_dict[data_module.cell_type_key].append(entry["celltype_name"])
+            obs_dict[batch_obs_key].append(entry["batch_name"])
+            obs_dict[pseudobulk_context_key].append(entry["context"])
+            obs_dict[pseudobulk_n_cells_key].append(count)
+            if data_module.batch_col and data_module.batch_col != batch_obs_key:
+                obs_dict[data_module.batch_col].append(entry["batch_name"])
+
+        obs = pd.DataFrame(obs_dict)
+        if store_raw_expression:
+            adata_pred = anndata.AnnData(X=pred_x, obs=obs)
+            adata_real = anndata.AnnData(X=real_x, obs=obs)
+            adata_pred.obsm[data_module.embed_key] = pred_bulk
+            adata_real.obsm[data_module.embed_key] = real_bulk
+        else:
+            adata_pred = anndata.AnnData(X=pred_bulk, obs=obs)
+            adata_real = anndata.AnnData(X=real_bulk, obs=obs)
+
+        clip_anndata_values(adata_pred, max_value=14.0)
+        clip_anndata_values(adata_real, max_value=14.0)
+        logger.info("Clipped pseudobulk adata_pred and adata_real X values to [0.0, 14.0].")
+
+        if args.shared_only:
+            try:
+                shared_perts = data_module.get_shared_perturbations()
+                if len(shared_perts) == 0:
+                    logger.warning("No shared perturbations between train and test; skipping filtering.")
+                else:
+                    logger.info(
+                        "Filtering pseudobulk rows to %d shared perturbations present in train ∩ test.",
+                        len(shared_perts),
+                    )
+                    mask = adata_pred.obs[data_module.pert_col].isin(shared_perts)
+                    before_n = adata_pred.n_obs
+                    adata_pred = adata_pred[mask].copy()
+                    adata_real = adata_real[mask].copy()
+                    logger.info(
+                        "Filtered pseudobulk rows: %d -> %d (kept only seen perturbations)",
+                        before_n,
+                        adata_pred.n_obs,
+                    )
+            except Exception as e:
+                logger.warning(
+                    "Failed to filter by shared perturbations (%s). Proceeding without filter.",
+                    str(e),
+                )
+
+        adata_pred_path = os.path.join(results_dir, "adata_pred.h5ad")
+        adata_real_path = os.path.join(results_dir, "adata_real.h5ad")
+        if args.skip_adatas:
+            logger.info("Skipping AnnData writes (--skip-adatas).")
+        else:
+            adata_pred.write_h5ad(adata_pred_path)
+            adata_real.write_h5ad(adata_real_path)
+            logger.info(f"Saved adata_pred to {adata_pred_path}")
+            logger.info(f"Saved adata_real to {adata_real_path}")
+
+        if not args.predict_only:
+            logger.info("Computing metrics using cell-eval...")
+            control_pert = data_module.get_control_pert()
+            ct_split_real = split_anndata_on_celltype(adata=adata_real, celltype_col=data_module.cell_type_key)
+            ct_split_pred = split_anndata_on_celltype(adata=adata_pred, celltype_col=data_module.cell_type_key)
+
+            assert len(ct_split_real) == len(ct_split_pred), (
+                f"Number of celltypes in real and pred anndata must match: {len(ct_split_real)} != {len(ct_split_pred)}"
+            )
+
+            pdex_kwargs = dict(exp_post_agg=True, is_log1p=True)
+            for ct in ct_split_real.keys():
+                real_ct = ct_split_real[ct]
+                pred_ct = ct_split_pred[ct]
+                evaluator = MetricsEvaluator(
+                    adata_pred=pred_ct,
+                    adata_real=real_ct,
+                    control_pert=control_pert,
+                    pert_col=data_module.pert_col,
+                    outdir=results_dir,
+                    prefix=ct,
+                    pdex_kwargs=pdex_kwargs,
+                    batch_size=2048,
+                )
+                evaluator.compute(
+                    profile=args.profile,
+                    metric_configs={
+                        "discrimination_score": {
+                            "embed_key": data_module.embed_key,
+                        }
+                        if data_module.embed_key and data_module.embed_key != "X_hvg"
+                        else {},
+                        "pearson_edistance": {
+                            "embed_key": data_module.embed_key,
+                            "n_jobs": -1,  # set to all available cores
+                        }
+                        if data_module.embed_key and data_module.embed_key != "X_hvg"
+                        else {
+                            "n_jobs": -1,
+                        },
+                    }
+                    if data_module.embed_key and data_module.embed_key != "X_hvg"
+                    else {},
+                    skip_metrics=["pearson_edistance", "clustering_agreement"],
+                )
+        return
+
+    final_preds = np.empty((num_cells, output_dim), dtype=np.float32)
+    final_reals = np.empty((num_cells, output_dim), dtype=np.float32)
 
     final_X_hvg = None
     final_pert_cell_counts_preds = None
@@ -329,63 +658,14 @@ def run_tx_predict(args: ap.ArgumentParser):
             batch_size = batch_preds["preds"].shape[0]
 
             # Handle gem_group - prefer human-readable batch names when available
-            def normalize_batch_labels(values):
-                if values is None:
-                    return None
-                if isinstance(values, torch.Tensor):
-                    values = values.detach().cpu().numpy()
-                if isinstance(values, np.ndarray):
-                    if values.ndim == 2:
-                        if values.shape[0] != batch_size:
-                            return None
-                        if values.shape[1] == 1:
-                            flat = values.reshape(batch_size)
-                            return [str(x) for x in flat.tolist()]
-                        indices = values.argmax(axis=1)
-                        return [str(int(x)) for x in indices.tolist()]
-                    if values.ndim == 1:
-                        if values.shape[0] != batch_size:
-                            return None
-                        return [str(x) for x in values.tolist()]
-                    if values.ndim == 0:
-                        return [str(values.item())] * batch_size
-                    return None
-                if isinstance(values, (list, tuple)):
-                    if len(values) != batch_size:
-                        return None
-                    normalized = []
-                    for item in values:
-                        if isinstance(item, torch.Tensor):
-                            item = item.detach().cpu().numpy()
-                        if isinstance(item, np.ndarray):
-                            if item.ndim == 0:
-                                normalized.append(str(item.item()))
-                                continue
-                            if item.ndim == 1:
-                                if item.size == 1:
-                                    normalized.append(str(item.item()))
-                                elif np.count_nonzero(item) == 1:
-                                    normalized.append(str(int(item.argmax())))
-                                else:
-                                    normalized.append(str(item.tolist()))
-                                continue
-                        normalized.append(str(item))
-                    return normalized
-                return [str(values)] * batch_size
-
-            batch_name_candidates = (
-                batch.get("batch_name"),
-                batch_preds.get("batch_name"),
-                batch_preds.get("batch"),
+            batch_labels = get_batch_labels(
+                (
+                    batch.get("batch_name"),
+                    batch_preds.get("batch_name"),
+                    batch_preds.get("batch"),
+                ),
+                batch_size,
             )
-
-            batch_labels = None
-            for candidate in batch_name_candidates:
-                batch_labels = normalize_batch_labels(candidate)
-                if batch_labels is not None:
-                    break
-            if batch_labels is None:
-                batch_labels = ["None"] * batch_size
             all_gem_groups.extend(batch_labels)
 
             batch_pred_np = batch_preds["preds"].cpu().numpy().astype(np.float32)
@@ -407,8 +687,6 @@ def run_tx_predict(args: ap.ArgumentParser):
     logger.info("Creating anndatas from predictions from manual loop...")
 
     # Build pandas DataFrame for obs and var
-    cfg_batch_col = cfg.get("data", {}).get("kwargs", {}).get("batch_col", None)
-    batch_obs_key = cfg_batch_col or data_module.batch_col
     print(batch_obs_key)
     df_dict = {
         data_module.pert_col: all_pert_names,
@@ -498,11 +776,14 @@ def run_tx_predict(args: ap.ArgumentParser):
     adata_pred_path = os.path.join(results_dir, "adata_pred.h5ad")
     adata_real_path = os.path.join(results_dir, "adata_real.h5ad")
 
-    adata_pred.write_h5ad(adata_pred_path)
-    adata_real.write_h5ad(adata_real_path)
+    if args.skip_adatas:
+        logger.info("Skipping AnnData writes (--skip-adatas).")
+    else:
+        adata_pred.write_h5ad(adata_pred_path)
+        adata_real.write_h5ad(adata_real_path)
 
-    logger.info(f"Saved adata_pred to {adata_pred_path}")
-    logger.info(f"Saved adata_real to {adata_real_path}")
+        logger.info(f"Saved adata_pred to {adata_pred_path}")
+        logger.info(f"Saved adata_real to {adata_real_path}")
 
     if not args.predict_only:
         # 6. Compute metrics using cell-eval

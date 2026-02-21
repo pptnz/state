@@ -8,6 +8,9 @@ kwargs:
   num_workers: 12
   pin_memory: true
   n_basal_samples: 1
+  downsample: null
+  downsample_cells: null
+  additional_obs: []
   basal_mapping_strategy: random
   should_yield_control_cells: true
   batch_col: gem_group
@@ -19,5 +22,7 @@ kwargs:
   store_raw_basal: false
   int_counts: false
   barcode: true
+  use_consecutive_loading: false
+  val_subsample_fraction: 1.0
 output_dir: null
 debug: true

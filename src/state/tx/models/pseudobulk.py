@@ -9,7 +9,6 @@ from geomloss import SamplesLoss
 
 from .base import PerturbationModel
 from .decoders import FinetuneVCICountsDecoder
-from .decoders_nb import NBDecoder, nb_nll
 from .utils import build_mlp, get_activation_class, get_transformer_backbone
 
 logger = logging.getLogger(__name__)
@@ -105,14 +104,6 @@ class PseudobulkPerturbationModel(PerturbationModel):
             # actually just set this to a relu for now
             self.relu = torch.nn.ReLU()
 
-        if kwargs.get("nb_decoder", False):
-            self.gene_decoder = NBDecoder(
-                latent_dim=self.output_dim + (self.batch_dim or 0),
-                gene_dim=gene_dim,
-                hidden_dims=[512, 512, 512],
-                dropout=self.dropout,
-            )
-
         control_pert = kwargs.get("control_pert", "non-targeting")
         if kwargs.get("finetune_vci_decoder", False):
             # Prefer the gene names supplied by the data module (aligned to training output)
@@ -157,7 +148,7 @@ class PseudobulkPerturbationModel(PerturbationModel):
             if len(blocks) > 0 and isinstance(blocks[0], nn.Sequential) and isinstance(blocks[0][0], nn.Linear):
                 return blocks[0][0].in_features
             return None
-        # NBDecoder: has .encoder (Sequential) starting with Linear
+        # Decoder implementations can expose .encoder (Sequential) starting with Linear
         if hasattr(gd, "encoder") and isinstance(getattr(gd, "encoder"), nn.Sequential):
             seq = gd.encoder
             for m in seq:
@@ -343,18 +334,13 @@ class PseudobulkPerturbationModel(PerturbationModel):
             if not isinstance(self.gene_decoder, FinetuneVCICountsDecoder):
                 latent_preds = self._maybe_concat_batch(latent_preds, batch["batch"], padded=True)
 
-            if isinstance(self.gene_decoder, NBDecoder):
-                mu, theta = self.gene_decoder(latent_preds)
-                gene_targets = batch["pert_cell_counts"].reshape_as(mu)
-                decoder_loss = nb_nll(gene_targets, mu, theta)
+            pert_cell_counts_preds = self.gene_decoder(latent_preds)
+            if padded:
+                gene_targets = gene_targets.reshape(-1, self.cell_sentence_len, self.gene_decoder.gene_dim())
             else:
-                pert_cell_counts_preds = self.gene_decoder(latent_preds)
-                if padded:
-                    gene_targets = gene_targets.reshape(-1, self.cell_sentence_len, self.gene_decoder.gene_dim())
-                else:
-                    gene_targets = gene_targets.reshape(1, -1, self.gene_decoder.gene_dim())
+                gene_targets = gene_targets.reshape(1, -1, self.gene_decoder.gene_dim())
 
-                decoder_loss = self.loss_fn(pert_cell_counts_preds, gene_targets).mean()
+            decoder_loss = self.loss_fn(pert_cell_counts_preds, gene_targets).mean()
 
             # Log decoder loss
             self.log("decoder_loss", decoder_loss)
@@ -380,20 +366,15 @@ class PseudobulkPerturbationModel(PerturbationModel):
             # Get model predictions from validation step
             latent_preds = pred
 
-            if isinstance(self.gene_decoder, NBDecoder):
-                mu, theta = self.gene_decoder(latent_preds)
-                gene_targets = batch["pert_cell_counts"].reshape_as(mu)
-                decoder_loss = nb_nll(gene_targets, mu, theta)
-            else:
-                # Match decoder input dims
-                if not isinstance(self.gene_decoder, FinetuneVCICountsDecoder):
-                    latent_preds = self._maybe_concat_batch(latent_preds, batch["batch"], padded=True)
-                pert_cell_counts_preds = self.gene_decoder(latent_preds)
+            # Match decoder input dims
+            if not isinstance(self.gene_decoder, FinetuneVCICountsDecoder):
+                latent_preds = self._maybe_concat_batch(latent_preds, batch["batch"], padded=True)
+            pert_cell_counts_preds = self.gene_decoder(latent_preds)
 
-                # Get decoder predictions
-                pert_cell_counts_preds = pert_cell_counts_preds.reshape(-1, self.cell_sentence_len, self.gene_dim)
-                gene_targets = gene_targets.reshape(-1, self.cell_sentence_len, self.gene_dim)
-                decoder_loss = self.loss_fn(pert_cell_counts_preds, gene_targets).mean()
+            # Get decoder predictions
+            pert_cell_counts_preds = pert_cell_counts_preds.reshape(-1, self.cell_sentence_len, self.gene_dim)
+            gene_targets = gene_targets.reshape(-1, self.cell_sentence_len, self.gene_dim)
+            decoder_loss = self.loss_fn(pert_cell_counts_preds, gene_targets).mean()
 
             # Log the validation metric
             self.log("decoder_val_loss", decoder_loss)
@@ -428,15 +409,10 @@ class PseudobulkPerturbationModel(PerturbationModel):
         basal_hvg = batch.get("ctrl_cell_counts", None)
 
         if self.gene_decoder is not None:
-            if isinstance(self.gene_decoder, NBDecoder):
-                # NB decoder already configured with latent_dim including batch if needed
-                mu, _ = self.gene_decoder(latent_output)
-                pert_cell_counts_preds = mu
-            else:
-                # Only concat batch covariates if decoder expects them
-                if not isinstance(self.gene_decoder, FinetuneVCICountsDecoder):
-                    latent_output = self._maybe_concat_batch(latent_output, batch["batch"], padded=padded)
-                pert_cell_counts_preds = self.gene_decoder(latent_output)
+            # Only concat batch covariates if decoder expects them
+            if not isinstance(self.gene_decoder, FinetuneVCICountsDecoder):
+                latent_output = self._maybe_concat_batch(latent_output, batch["batch"], padded=padded)
+            pert_cell_counts_preds = self.gene_decoder(latent_output)
             output_dict["pert_cell_counts_preds"] = pert_cell_counts_preds
 
         return output_dict

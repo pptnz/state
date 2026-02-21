@@ -18,7 +18,6 @@ kwargs:
   residual_decoder: False
   decoder_loss_weight: 1.0
   batch_encoder: False
-  nb_decoder: False
   mask_attn: False
   use_effect_gating_token: False
   use_basal_projection: False

@@ -15,7 +15,6 @@ kwargs:
   freeze_pert_backbone: False
   transformer_decoder: False
   finetune_vci_decoder: False
-  nb_decoder: False
   distributional_loss: energy
   transformer_backbone_key: GPT2
   transformer_backbone_kwargs:
