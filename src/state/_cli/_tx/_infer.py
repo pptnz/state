@@ -35,7 +35,8 @@ def add_arguments_infer(parser: argparse.ArgumentParser):
         required=True,
         help=(
             "Path to the training run directory. Must contain config.yaml, var_dims.pkl, pert_onehot_map.pt, and "
-            "batch_onehot_map.torch (legacy batch_onehot_map.pkl is also supported)."
+            "batch_onehot_map.torch (legacy batch_onehot_map.pkl is also supported). "
+            "cell_type_onehot_map.torch is optional (legacy cell_type_onehot_map.pkl is also supported)."
         ),
     )
     parser.add_argument(
@@ -183,11 +184,11 @@ def run_tx_infer(args: argparse.Namespace):
             return int(v)
         return None
 
-    def load_batch_onehot_map(model_dir: str):
+    def load_onehot_map(model_dir: str, basename: str):
         candidates = [
-            "batch_onehot_map.torch",
-            "batch_onehot_map.pt",
-            "batch_onehot_map.pkl",
+            f"{basename}.torch",
+            f"{basename}.pt",
+            f"{basename}.pkl",
         ]
         resolved_paths = [os.path.join(model_dir, name) for name in candidates]
         for path in resolved_paths:
@@ -417,9 +418,14 @@ def run_tx_infer(args: argparse.Namespace):
     pert_name_lookup: Dict[str, object] = {str(k): k for k in pert_onehot_map.keys()}
     pert_names_in_map: List[str] = list(pert_name_lookup.keys())
 
-    batch_onehot_map, loaded_batch_onehot_map_path, batch_onehot_map_candidates = load_batch_onehot_map(args.model_dir)
+    batch_onehot_map, loaded_batch_onehot_map_path, batch_onehot_map_candidates = load_onehot_map(
+        args.model_dir, "batch_onehot_map"
+    )
     if loaded_batch_onehot_map_path is not None and not args.quiet:
         print(f"Loaded batch one-hot map from: {loaded_batch_onehot_map_path}")
+    cell_type_onehot_map, loaded_cell_type_onehot_map_path, _ = load_onehot_map(args.model_dir, "cell_type_onehot_map")
+    if loaded_cell_type_onehot_map_path is not None and not args.quiet:
+        print(f"Loaded cell type one-hot map from: {loaded_cell_type_onehot_map_path}")
 
     # -----------------------
     # 2) Load model
@@ -469,6 +475,17 @@ def run_tx_infer(args: argparse.Namespace):
     # optional filter by cell types
     if args.celltype_col and args.celltypes:
         keep_cts = [ct.strip() for ct in args.celltypes.split(",")]
+        if cell_type_onehot_map is not None:
+            available_cell_types = {str(k) for k in cell_type_onehot_map.keys()}
+            missing_in_map = [ct for ct in keep_cts if ct not in available_cell_types]
+            if missing_in_map and not args.quiet:
+                preview = ", ".join(missing_in_map[:5])
+                if len(missing_in_map) > 5:
+                    preview += ", ..."
+                print(
+                    f"Warning: {len(missing_in_map)} requested cell types not found in saved mapping "
+                    f"(examples: {preview})."
+                )
         if args.celltype_col not in adata.obs:
             raise ValueError(f"Column '{args.celltype_col}' not in adata.obs")
         n0 = adata.n_obs

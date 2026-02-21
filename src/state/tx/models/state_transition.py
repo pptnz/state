@@ -506,7 +506,7 @@ class StateTransitionPerturbationModel(PerturbationModel):
             out_pred = self.project_out(res_pred) + basal
             out_pred = self.final_down_then_up(out_pred)
         elif self.predict_residual:
-            out_pred = self.project_out(res_pred) + basal
+            out_pred = self.project_out(res_pred + control_cells)
         else:
             out_pred = self.project_out(res_pred)
 

@@ -53,21 +53,6 @@ def add_arguments_predict(parser: ap.ArgumentParser):
     )
 
     parser.add_argument(
-        "--skip-de",
-        action="store_true",
-        help="If set, skip DE computation in cell-eval and only compute AnnData-based metrics.",
-    )
-    parser.add_argument(
-        "--fix-cells",
-        type=int,
-        default=None,
-        help=(
-            "If set to a positive int, resample each perturbation condition to this "
-            "many cells before DE computation (0 or None disables)."
-        ),
-    )
-
-    parser.add_argument(
         "--shared-only",
         action="store_true",
         help=("If set, restrict predictions/evaluation to perturbations shared between train and test (train ∩ test)."),
@@ -88,13 +73,6 @@ def add_arguments_predict(parser: ap.ArgumentParser):
         ),
     )
 
-    parser.add_argument(
-        "--split-by-context",
-        action="store_true",
-        help=("Deprecated alias for --pseudobulk."),
-    )
-
-
 def run_tx_predict(args: ap.ArgumentParser):
     import logging
     import os
@@ -113,6 +91,7 @@ def run_tx_predict(args: ap.ArgumentParser):
     from cell_eval.utils import split_anndata_on_celltype
     from cell_load.data_modules import PerturbationDataModule
     from tqdm import tqdm
+    from ._utils import normalize_batch_labels
 
     logging.basicConfig(level=logging.INFO)
     logger = logging.getLogger(__name__)
@@ -121,14 +100,6 @@ def run_tx_predict(args: ap.ArgumentParser):
 
     if args.predict_only and args.skip_adatas:
         logger.warning("Both --predict-only and --skip-adatas were set; no prediction artifacts will be written.")
-    if args.profile == "anndata" and not args.skip_de:
-        logger.warning(
-            "--profile anndata does not disable DE computation by itself. "
-            "Add --skip-de to skip DE and reduce memory/runtime."
-        )
-    if args.split_by_context and not args.pseudobulk:
-        logger.warning("--split-by-context is deprecated; treating it as --pseudobulk.")
-        args.pseudobulk = True
 
     def run_test_time_finetune(model, dataloader, ft_epochs, control_pert, device):
         """
@@ -183,50 +154,6 @@ def run_tx_predict(args: ap.ArgumentParser):
                     adata.X.eliminate_zeros()
         else:
             np.clip(adata.X, min_value, max_value, out=adata.X)
-
-    def normalize_batch_labels(values, batch_size: int):
-        if values is None:
-            return None
-        if isinstance(values, torch.Tensor):
-            values = values.detach().cpu().numpy()
-        if isinstance(values, np.ndarray):
-            if values.ndim == 2:
-                if values.shape[0] != batch_size:
-                    return None
-                if values.shape[1] == 1:
-                    flat = values.reshape(batch_size)
-                    return [str(x) for x in flat.tolist()]
-                indices = values.argmax(axis=1)
-                return [str(int(x)) for x in indices.tolist()]
-            if values.ndim == 1:
-                if values.shape[0] != batch_size:
-                    return None
-                return [str(x) for x in values.tolist()]
-            if values.ndim == 0:
-                return [str(values.item())] * batch_size
-            return None
-        if isinstance(values, (list, tuple)):
-            if len(values) != batch_size:
-                return None
-            normalized = []
-            for item in values:
-                if isinstance(item, torch.Tensor):
-                    item = item.detach().cpu().numpy()
-                if isinstance(item, np.ndarray):
-                    if item.ndim == 0:
-                        normalized.append(str(item.item()))
-                        continue
-                    if item.ndim == 1:
-                        if item.size == 1:
-                            normalized.append(str(item.item()))
-                        elif np.count_nonzero(item) == 1:
-                            normalized.append(str(int(item.argmax())))
-                        else:
-                            normalized.append(str(item.tolist()))
-                        continue
-                normalized.append(str(item))
-            return normalized
-        return [str(values)] * batch_size
 
     def get_batch_labels(candidates, batch_size: int):
         batch_labels = None
