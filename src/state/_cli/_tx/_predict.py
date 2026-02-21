@@ -653,8 +653,6 @@ def run_tx_predict(args: ap.ArgumentParser):
                     prefix=ct,
                     pdex_kwargs=pdex_kwargs,
                     batch_size=2048,
-                    skip_de=args.skip_de,
-                    fix_cells=args.fix_cells,
                 )
                 evaluator.compute(
                     profile=args.profile,
@@ -889,8 +887,6 @@ def run_tx_predict(args: ap.ArgumentParser):
                 prefix=ct,
                 pdex_kwargs=pdex_kwargs,
                 batch_size=2048,
-                skip_de=args.skip_de,
-                fix_cells=args.fix_cells,
             )
 
             evaluator.compute(
