@@ -91,9 +91,7 @@ def add_arguments_predict(parser: ap.ArgumentParser):
     parser.add_argument(
         "--split-by-context",
         action="store_true",
-        help=(
-            "Deprecated alias for --pseudobulk."
-        ),
+        help=("Deprecated alias for --pseudobulk."),
     )
 
 
