@@ -1,9 +1,10 @@
 """
 Genetic perturbation prediction using STATE (ST-SE-Replogle).
 
-Two-step pipeline:
+Three-step pipeline:
   1. Embed cells using SE-600M
-  2. Predict perturbed transcriptome using ST-SE-Replogle
+  2. Predict perturbed cell embeddings using ST-SE-Replogle
+  3. Decode embeddings back to full gene expression using SE-600M decoder
 
 Prerequisites:
   - Install STATE: `uv tool install arc-state` or `uv pip install arc-state`
@@ -211,6 +212,68 @@ def step2_predict_perturbation(
     return output_h5ad
 
 
+def step3_decode_to_genes(
+    perturbed_h5ad: str,
+    se_model_dir: str,
+    output_h5ad: str,
+    embed_key: str = "X_state",
+    batch_size: int = 64,
+):
+    """Decode cell embeddings (original + perturbed) to full gene expression using SE-600M."""
+    from state.emb.inference import Inference
+
+    print("=" * 60)
+    print("Step 3: Decoding embeddings to gene expression space")
+    print("=" * 60)
+
+    checkpoint = os.path.join(se_model_dir, "se600m_epoch16.ckpt")
+    if not os.path.exists(checkpoint):
+        ckpts = list(Path(se_model_dir).glob("*.ckpt"))
+        if not ckpts:
+            raise FileNotFoundError(f"No .ckpt files found in {se_model_dir}")
+        checkpoint = str(ckpts[-1])
+        print(f"Using SE checkpoint: {checkpoint}")
+
+    pe_path = os.path.join(se_model_dir, "protein_embeddings.pt")
+    protein_embeds = None
+    if os.path.exists(pe_path):
+        protein_embeds = torch.load(pe_path, weights_only=False, map_location="cpu")
+
+    inferer = Inference(protein_embeds=protein_embeds)
+    inferer.load_model(checkpoint)
+
+    adata = sc.read_h5ad(perturbed_h5ad)
+    genes = adata.var.index
+    print(f"Decoding {adata.n_obs} cells x {len(genes)} genes")
+
+    def _collect_decoded(key):
+        batches = []
+        for batch in inferer.decode_from_adata(adata, genes, key, read_depth=4.0, batch_size=batch_size):
+            if batch.ndim == 1:
+                batch = batch.reshape(1, -1)
+            batches.append(batch)
+        return np.vstack(batches).astype(np.float32)
+
+    print("  Decoding control embeddings...")
+    ctrl_expr = _collect_decoded(embed_key)
+    print(f"    -> shape: {ctrl_expr.shape}")
+
+    pert_emb_key = f"{embed_key}_perturbed"
+    print("  Decoding perturbed embeddings...")
+    pert_expr = _collect_decoded(pert_emb_key)
+    print(f"    -> shape: {pert_expr.shape}")
+
+    adata.layers["gene_expression_ctrl"] = ctrl_expr
+    adata.layers["gene_expression_pert"] = pert_expr
+    adata.write_h5ad(output_h5ad)
+
+    print(f"\nFull gene expression saved to {output_h5ad}")
+    print(f"  .layers['gene_expression_ctrl']:  control {ctrl_expr.shape}")
+    print(f"  .layers['gene_expression_pert']:  perturbed {pert_expr.shape}")
+
+    return output_h5ad
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Predict gene knockdown effects using STATE (SE-600M + ST-SE-Replogle)"
@@ -276,13 +339,26 @@ def main():
         )
 
     # Step 2: Predict perturbation
-    step2_predict_perturbation(
-        embedded_h5ad=embedded_path,
-        st_model_dir=st_run_dir,
-        target_gene=args.gene,
+    if not os.path.exists(output_path):
+        step2_predict_perturbation(
+            embedded_h5ad=embedded_path,
+            st_model_dir=st_run_dir,
+            target_gene=args.gene,
+            output_h5ad=output_path,
+            embed_key=args.embed_key,
+        )
+
+    # Step 3: Decode embeddings to full gene expression
+    step3_decode_to_genes(
+        perturbed_h5ad=output_path,
+        se_model_dir=args.se_model_dir,
         output_h5ad=output_path,
         embed_key=args.embed_key,
     )
+
+    # save adata.layers['gene_expression_pert'] as txt
+    adata = sc.read_h5ad(output_path)
+    adata.layers['gene_expression_pert'].to_csv('gene_expression_pert.txt', sep='\t')
 
     print("\n" + "=" * 60)
     print("DONE!")
@@ -290,10 +366,14 @@ def main():
     print(f"\nTo analyze results in Python:")
     print(f"  import scanpy as sc")
     print(f"  adata = sc.read_h5ad('{output_path}')")
-    print(f"  original = adata.obsm['{args.embed_key}']")
-    print(f"  perturbed = adata.obsm['{args.embed_key}_perturbed']")
-    print(f"  delta = perturbed - original  # perturbation effect in embedding space")
-
+    print(f"")
+    print(f"  # Full gene expression (n_cells x n_genes):")
+    print(f"  ctrl_expr  = adata.layers['gene_expression_ctrl']")
+    print(f"  pert_expr  = adata.layers['gene_expression_pert']")
+    print(f"")
+    print(f"  # Cell embeddings (n_cells x 2058):")
+    print(f"  ctrl_emb  = adata.obsm['{args.embed_key}']")
+    print(f"  pert_emb  = adata.obsm['{args.embed_key}_perturbed']")
 
 if __name__ == "__main__":
     main()
