@@ -11,16 +11,21 @@ Prerequisites:
   - Download models (see DOWNLOAD COMMANDS below)
 
 DOWNLOAD COMMANDS (run once):
-  ```
-  # Install git-lfs first if needed
-  git lfs install
+    ```
+    from huggingface_hub import snapshot_download
 
-  # 1) SE-600M (cell embedding model, ~11.5 GB checkpoint)
-  git clone https://huggingface.co/arcinstitute/SE-600M ./models/SE-600M
+    snapshot_download(
+        repo_id="arcinstitute/SE-600M",
+        local_dir="SE-600M",
+        local_dir_use_symlinks=False
+    )
 
-  # 2) ST-SE-Replogle (perturbation prediction model)
-  git clone https://huggingface.co/arcinstitute/ST-SE-Replogle ./models/ST-SE-Replogle
-  ```
+    snapshot_download(
+        repo_id="arcinstitute/ST-SE-Replogle",
+        local_dir="ST-SE-Replogle",
+        local_dir_use_symlinks=False
+    )
+    ```
 
 Usage:
   python run_genetic_perturbation.py \
