@@ -360,6 +360,9 @@ def main():
         )
         gene_counts_pert.to_csv(args.input.replace(".h5ad", "_pert_" + args.gene + ".txt"), sep="\t")
 
+        # save adata.obs
+        adata.obs.to_csv(args.input.replace(".h5ad", "_obs.csv"))
+
     # ------------------------------------------------------------------
     # Summary
     # ------------------------------------------------------------------
